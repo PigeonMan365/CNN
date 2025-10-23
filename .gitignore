@@ -1,0 +1,60 @@
+# -----------------------------
+# Python basics
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+
+# -----------------------------
+# Project artifacts
+# -----------------------------
+# Logs & TensorBoard (rebuildable)
+logs/
+!logs/.gitkeep
+# If you want to keep orchestration history in git, UNCOMMENT next line:
+#!logs/orchestrate_plan.log
+
+# Training runs (checkpoints, metrics)
+runs/
+
+# Exported models (large binaries)
+export_models/
+
+# Caches & temp
+cache/
+tmp/
+
+# Dataset (raw + converted)
+dataset/input/
+dataset/output/
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / model files (catch any strays)
+*.pt
+*.pth
+*.ts.pt

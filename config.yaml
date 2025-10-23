@@ -1,0 +1,53 @@
+# MalNet-FocusAug configuration (paths must be set explicitly; no hardcoded defaults)
+
+paths:
+  # VM-side binary conversion I/O
+  input_roots: ["dataset/input"]          # REQUIRED: list of directories to scan for raw binaries (e.g., ["/vault/malware/input", "dataset/input"])
+  images_root: "dataset/output"          # REQUIRED: directory to write converted PNGs (e.g., "/vault/malware/output" or "dataset/output")
+  logs_root: "logs"            # REQUIRED: directory for logs (e.g., "/vault/malware/logs" or "logs")
+  conversion_log: "logs/conversion_log.csv"       # REQUIRED: unified manifest CSV path (e.g., "/vault/malware/logs/conversion_log.csv")
+  tmp_root: "tmp"             # REQUIRED: temp workspace for safe binary copies (VM-only)
+  cache_root: "cache"           # REQUIRED: SSD cache root for staging (used by preprocessing/training if enabled)
+  cache_max_bytes: "40GB" # default cap you chose
+
+train_io:
+  # Desktop-side training I/O
+  data_csv: "logs/conversion_log.csv"             # REQUIRED: path to conversion_log.csv on the training host
+  images_root: "dataset/output"          # REQUIRED: where PNGs live on the training host
+  runs_root: "runs"            # REQUIRED: parent directory for all run artifacts (each run gets its own subdir)
+  run_index: "logs/index.csv"            # REQUIRED: path to a CSV registry of all runs (e.g., "logs/index.csv")
+  checkpoints_root: ""     # optional override; if empty -> runs_root/<run_id>/checkpoints
+  tensorboard_root: ""     # optional override; if empty -> runs_root/<run_id>/tb
+
+model:
+  channels: [32, 64, 128]  # three residual stages (two convs each), as specified
+  attention: true          # mandatory attention branch per your spec
+
+training:
+  epochs: 5               # tune later
+  amp: true                # mixed precision if GPU available
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  optimizer: "adamw"
+  scheduler: "onecycle"
+  max_lr: "auto"           # auto-tuned baseline
+  mode: compress        # compress or truncate
+  batch_size: 8   # set from verify_setup suggestion; try 8–32 on GPU, 4–16 on CPU
+  use_disk_cache: true         # stage files from HDD to SSD cache
+  prefetch_batches: 4          # DataLoader prefetch_factor (per worker)
+  num_workers: 4               # tune per machine (CPU cores / 2 is a decent start)
+  decode_cache_mem_mb: 512     # in-RAM decoded tensor cache budget (~512MB)
+  holdout: 80
+  kfold: 5
+
+
+sampler:
+  type: "sharded"          # resumable, deterministic, scale-friendly
+  shard_size: 100000
+  shuffle_seed: 42
+
+checkpoint:
+  mini_every_batches: 200  # target ~10 minutes between minis; adjust after first run
+  keep_last_k: 3
+  save_rng_state: true
+  save_scheduler: true
