@@ -7,7 +7,7 @@ Subcommands:
   convert           -> convert binaries to PNGs (both modes) using preprocessing tools
   train             -> run a single training job (optionally override --mode/--seed)
   orchestrate       -> plan/status/resume multi-run experiments (resumable)
-  reset             -> clean artifacts; rebuild conversion_log.csv from dataset/output
+  reset             -> clean artifacts; rebuild conversion_log.csv AND recreate project skeleton
 
 Notes:
 - Orchestration is implemented in orchestrate.py and called from here.
@@ -86,8 +86,87 @@ def rebuild_conversion_log(images_root: Path, out_csv: Path):
     with out_csv.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["rel_path", "label", "mode", "sha256"])
-        w.writerows(rows)
+        if rows:
+            w.writerows(rows)
     print(f"[RESET] Rebuilt {out_csv} with {len(rows)} rows (relative to images_root={images_root})")
+
+def ensure_index_csv(index_csv: Path):
+    """Create logs/index.csv with a sane header if missing."""
+    if not index_csv.exists():
+        ensure_dir(index_csv.parent)
+        with index_csv.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "run_id","mode","seed","kfold","epochs",
+                "start_time","end_time","status","export_path"
+            ])
+        print(f"[RESET] Created stub run index: {index_csv}")
+
+def ensure_orchestrate_log(plan_log: Path):
+    """Touch the orchestrate plan log so status/resume can run without errors."""
+    ensure_dir(plan_log.parent)
+    if not plan_log.exists():
+        plan_log.write_text("")
+        print(f"[RESET] Created orchestrate plan log: {plan_log}")
+
+def ensure_dataset_skeleton(images_root: Path, input_roots: list[str] | None = None):
+    """
+    Create dataset skeleton:
+      dataset/input/{benign,malware}/
+      images_root/{compress,truncate}/{benign,malware}/
+    """
+    # Input roots
+    roots = input_roots or []
+    if not roots:
+        # default to dataset/input
+        roots = ["dataset/input"]
+    for r in roots:
+        base = Path(r)
+        ensure_dir(base / "benign")
+        ensure_dir(base / "malware")
+
+    # Output structure under images_root
+    for mode in ("compress", "truncate"):
+        for cls in ("benign", "malware"):
+            ensure_dir(images_root / mode / cls)
+
+def ensure_project_skeleton(cfg: dict):
+    """
+    After reset, ensure all required directories and stub files exist.
+    """
+    paths = cfg.get("paths", {})
+    ti    = cfg.get("train_io", {})
+
+    # Resolve roots
+    runs_dir   = Path(ti.get("runs_root", "runs")).resolve()
+    cache_dir  = Path(paths.get("cache_root", "cache")).resolve()
+    tmp_dir    = Path(paths.get("tmp_root", "tmp")).resolve()
+    tb_dir     = Path("logs/tensorboard").resolve()
+    index_csv  = Path(ti.get("run_index", "logs/index.csv")).resolve()
+    conv_csv   = Path(paths.get("conversion_log", ti.get("data_csv", "logs/conversion_log.csv"))).resolve()
+    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output"))).resolve()
+    plan_log   = Path("logs/orchestrate_plan.log").resolve()
+    export_dir = Path("export_models").resolve()
+
+    # Ensure dirs
+    ensure_dir(runs_dir)
+    ensure_dir(cache_dir)
+    ensure_dir(tmp_dir)
+    ensure_dir(tb_dir)
+    ensure_dir(export_dir)
+    ensure_dir(conv_csv.parent)
+
+    # Ensure dataset structure
+    input_roots = paths.get("input_roots") or cfg.get("paths", {}).get("input_roots")
+    ensure_dataset_skeleton(images_root, input_roots)
+
+    # Ensure stub files
+    ensure_index_csv(index_csv)
+    ensure_orchestrate_log(plan_log)
+
+    # Ensure conversion log exists (empty with header if not already)
+    if not conv_csv.exists():
+        rebuild_conversion_log(images_root, conv_csv)
 
 def do_reset(yes: bool, cfg: dict):
     # Resolve paths
@@ -118,13 +197,13 @@ def do_reset(yes: bool, cfg: dict):
             shutil.rmtree(p, ignore_errors=True)
             print(f"[RESET] Deleted dir: {p}")
 
-    for f in [index_csv]:
-        if f.exists():
-            try:
-                f.unlink()
-                print(f"[RESET] Deleted file: {f}")
-            except Exception:
-                pass
+    # Delete index (we recreate a fresh stub)
+    if index_csv.exists():
+        try:
+            index_csv.unlink()
+            print(f"[RESET] Deleted file: {index_csv}")
+        except Exception:
+            pass
 
     # Always delete conversion_log then rebuild it
     if conv_csv.exists():
@@ -134,6 +213,8 @@ def do_reset(yes: bool, cfg: dict):
         except Exception:
             pass
 
+    # Recreate the full skeleton and rebuild CSV
+    ensure_project_skeleton(cfg)
     rebuild_conversion_log(images_root, conv_csv)
     print("[RESET] Done.")
 
@@ -177,6 +258,8 @@ def cmd_train(args):
         cmd += ["--mode", args.mode]
     if args.seed is not None:
         cmd += ["--seed", str(args.seed)]
+    if args.resume:
+        cmd += ["--resume"]
 
     print("> " + " ".join(cmd))
     subprocess.run(cmd, check=False)
@@ -189,17 +272,11 @@ def cmd_orchestrate(args):
       - resume
     """
     ensure_dir(Path("logs"))
-    # Support:
-    #   python main.py orchestrate --runs N        -> plan
-    #   python main.py orchestrate plan --runs N
-    #   python main.py orchestrate status
-    #   python main.py orchestrate resume
     if args.action == "status":
         cmd = [sys.executable, "orchestrate.py", "status"]
     elif args.action == "resume":
         cmd = [sys.executable, "orchestrate.py", "resume"]
     else:
-        # default "plan"
         if args.runs is None or args.runs <= 0:
             print("[ORCH] --runs N is required and must be > 0.")
             sys.exit(2)
@@ -237,6 +314,7 @@ def build_parser():
     # agreed overrides:
     p_train.add_argument("--mode", type=str, choices=["compress", "truncate"], help="Override training mode (config default otherwise)")
     p_train.add_argument("--seed", type=int, help="Override RNG seed (config default otherwise)")
+    p_train.add_argument("--resume", action="store_true", help="Resume this run at fold boundaries if checkpoints exist.")
     p_train.set_defaults(func=cmd_train)
 
     # orchestrate
@@ -260,7 +338,7 @@ def build_parser():
     p_orch_resume.set_defaults(func=cmd_orchestrate)
 
     # reset
-    p_reset = sub.add_parser("reset", help="Clean artifacts and rebuild conversion_log.csv from dataset/output. Use --yes to confirm.")
+    p_reset = sub.add_parser("reset", help="Clean artifacts, rebuild conversion_log.csv, and recreate project skeleton. Use --yes to confirm.")
     p_reset.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
     p_reset.add_argument("--yes", action="store_true", help="Actually delete. Without this flag it's a dry run.")
     p_reset.set_defaults(func=cmd_reset)
@@ -273,11 +351,9 @@ def main():
 
     # Special case: allow `python main.py orchestrate --runs N` (no explicit sub-action)
     if args.cmd == "orchestrate" and getattr(args, "action", None) is None:
-        # if --runs present -> treat as plan
         if getattr(args, "runs", None):
             args.action = "plan"
         else:
-            # No action, no runs -> print short help
             print("Usage:")
             print("  python main.py orchestrate --runs N       # PLAN ONLY (shorthand)")
             print("  python main.py orchestrate plan --runs N  # PLAN ONLY (explicit)")
