@@ -8,7 +8,7 @@ paths:
   conversion_log: "logs/conversion_log.csv"       # REQUIRED: unified manifest CSV path (e.g., "/vault/malware/logs/conversion_log.csv")
   tmp_root: "tmp"             # REQUIRED: temp workspace for safe binary copies (VM-only)
   cache_root: "cache"           # REQUIRED: SSD cache root for staging (used by preprocessing/training if enabled)
-  cache_max_bytes: "40GB" # default cap you chose
+  cache_max_bytes: "66GB" # default cap you chose
 
 train_io:
   # Desktop-side training I/O
@@ -24,7 +24,7 @@ model:
   attention: true          # mandatory attention branch per your spec
 
 training:
-  epochs: 5               # tune later
+  torch_compile: false
   amp: true                # mixed precision if GPU available
   weight_decay: 0.0001
   grad_clip: 1.0
@@ -32,13 +32,16 @@ training:
   scheduler: "onecycle"
   max_lr: "auto"           # auto-tuned baseline
   mode: compress        # compress or truncate
-  batch_size: 8   # set from verify_setup suggestion; try 8–32 on GPU, 4–16 on CPU
+  batch_size: 64   # set from verify_setup suggestion; try 8–32 on GPU, 4–16 on CPU
   use_disk_cache: true         # stage files from HDD to SSD cache
+  pin_memory: true
+  persistent_workers: true
   prefetch_batches: 4          # DataLoader prefetch_factor (per worker)
   num_workers: 4               # tune per machine (CPU cores / 2 is a decent start)
-  decode_cache_mem_mb: 512     # in-RAM decoded tensor cache budget (~512MB)
-  holdout: 80
-  kfold: 5
+  decode_cache_mem_mb: 1024     # in-RAM decoded tensor cache budget (~512MB)
+  holdout: 20
+  kfold: 4
+  epochs: 4               # tune later
 
 
 sampler:

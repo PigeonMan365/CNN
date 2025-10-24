@@ -1,308 +1,363 @@
 #!/usr/bin/env python3
-"""
-verify_setup.py — environment + data audit with training knob recommendations.
+# -*- coding: utf-8 -*-
 
-What it does:
-- Prints Python & PyTorch info, CUDA/GPU, CPU cores, RAM.
-- Reads config.yaml to find:
-    - train_io.data_csv   (usually logs/conversion_log.csv)
-    - train_io.images_root (dataset/output by default)
-    - paths.cache_root
-- Scans the CSV to summarize dataset size per mode (compress/truncate) and
-  approximate unique groups (sha256).
-- Recommends:
-    training.batch_size
-    training.num_workers
-    training.prefetch_batches
-    training.decode_cache_mem_mb
-    paths.cache_max_bytes
-    training.kfold
-- DOES NOT change your files; prints suggestions for you to copy.
+"""
+verify_setup.py — richer environment & data diagnostics + speed-oriented recommendations
+Now also considers SSD/disk space for images_root and cache_root in its guidance.
+
+It prints:
+- Python, PyTorch, CUDA, GPU name/VRAM, CPU cores, System RAM
+- Requirements check (imports) from requirements.txt
+- Paths (from config.yaml or defaults)
+- Disk usage (total/free) for images_root and cache_root + same-device check
+- Dataset summary (from logs/conversion_log.csv)
+- Speed recommendations (batch size, workers, prefetch, pin_memory, persistent_workers, AMP)
+- Cache recommendations based on *free disk* at cache_root (paths.cache_max_bytes & use_disk_cache)
 """
 
+from __future__ import annotations
 import os
 import sys
 import csv
 import json
-import math
-import platform
+import shutil
+import importlib
 from pathlib import Path
-from typing import Dict, Tuple
 
-# Optional deps
-try:
-    import yaml
-except Exception:
-    yaml = None
+# ---------------- helpers ----------------
 
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-try:
-    import torch
-except Exception:
-    torch = None
-
-
-# ----------------------------- helpers -----------------------------
-
-def _hb(n: float) -> str:
-    """Human bytes."""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while n >= 1024.0 and i < len(units) - 1:
-        n /= 1024.0
-        i += 1
-    return f"{n:.1f}{units[i]}"
-
-def _read_cfg(cfg_path: Path) -> dict:
-    if yaml is None:
-        print("[WARN] PyYAML not installed; cannot read config.yaml. Install: pip install pyyaml")
-        return {}
-    if not cfg_path.exists():
-        print(f"[WARN] {cfg_path} not found.")
-        return {}
+def load_yaml(path="config.yaml") -> dict:
     try:
-        return yaml.safe_load(cfg_path.read_text())
-    except Exception as e:
-        print(f"[WARN] Could not parse {cfg_path}: {e}")
-        return {}
-
-def _dataset_summary(csv_path: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """
-    Returns:
-      (by_mode_count, by_mode_unique_groups)
-    """
-    by_mode = {}
-    by_mode_groups = {}
-    if not csv_path.exists():
-        print(f"[WARN] CSV not found: {csv_path}")
-        return by_mode, by_mode_groups
-
-    try:
-        with csv_path.open("r", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                mode = row.get("mode", "").strip()
-                by_mode[mode] = by_mode.get(mode, 0) + 1
-                g = (row.get("sha256") or "").strip()
-                if mode not in by_mode_groups:
-                    by_mode_groups[mode] = set()
-                if g:
-                    by_mode_groups[mode].add(g)
-    except Exception as e:
-        print(f"[WARN] Failed to read {csv_path}: {e}")
-        return by_mode, {k: len(v) for k, v in by_mode_groups.items()}
-
-    return by_mode, {k: len(v) for k, v in by_mode_groups.items()}
-
-def _gpu_info():
-    if torch is None:
-        return None
-    if not torch.cuda.is_available():
-        return None
-    dev = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(dev)
-    return {
-        "name": props.name,
-        "total_mem": props.total_memory,
-        "sm_count": getattr(props, "multi_processor_count", None)
-    }
-
-def _cpu_info():
-    cores = os.cpu_count() or 1
-    ram_total = None
-    ram_avail = None
-    if psutil:
-        vm = psutil.virtual_memory()
-        ram_total = vm.total
-        ram_avail = vm.available
-    return {"cores": cores, "ram_total": ram_total, "ram_avail": ram_avail}
-
-def _disk_free(path: Path):
-    if psutil is None:
-        return None
-    try:
-        usage = psutil.disk_usage(str(path))
-        return usage  # total, used, free, percent
+        import yaml
     except Exception:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return yaml.safe_load(p.read_text())
+    except Exception:
+        return {}
+
+def bytes_to_gb(n: int) -> float:
+    return round(n / (1024**3), 2)
+
+def get_ram_info():
+    # psutil is preferred; fallbacks provided
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return {"total": vm.total, "available": vm.available, "used": vm.used}
+    except Exception:
+        if os.name == "nt":
+            try:
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('sullAvailExtendedVirtual', ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                return {
+                    "total": int(stat.ullTotalPhys),
+                    "available": int(stat.ullAvailPhys),
+                    "used": int(stat.ullTotalPhys - stat.ullAvailPhys),
+                }
+            except Exception:
+                return {}
+        else:
+            try:
+                info = {}
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        k, v = line.strip().split(":", 1)
+                        info[k] = v.strip()
+                def kB(x): return int(x.split()[0]) * 1024
+                total = kB(info.get("MemTotal", "0 kB"))
+                free = kB(info.get("MemAvailable", "0 kB"))
+                used = total - free
+                return {"total": total, "available": free, "used": used}
+            except Exception:
+                return {}
+
+def get_gpu_info():
+    info = {"cuda_available": False, "name": None, "total_mem": None}
+    try:
+        import torch
+        info["cuda_available"] = torch.cuda.is_available()
+        if info["cuda_available"] and torch.cuda.device_count() > 0:
+            i = torch.cuda.current_device()
+            info["name"] = torch.cuda.get_device_name(i)
+            info["total_mem"] = torch.cuda.get_device_properties(i).total_memory
+    except Exception:
+        pass
+    return info
+
+def parse_requirements(req_path="requirements.txt"):
+    reqs = []
+    p = Path(req_path)
+    if not p.exists():
+        return reqs
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        pkg = s.split(";")[0].split("==")[0].split(">=")[0].split("<=")[0].strip()
+        if pkg:
+            reqs.append(pkg)
+    return reqs
+
+def import_name_for(pkg: str) -> str:
+    m = {
+        "pillow": "PIL",
+        "pyyaml": "yaml",
+        "scikit-learn": "sklearn",
+        "opencv-python": "cv2",
+        "pandas": "pandas",
+        "numpy": "numpy",
+        "tqdm": "tqdm",
+        "matplotlib": "matplotlib",
+        "psutil": "psutil",
+        "torch": "torch",
+        "torchvision": "torchvision",
+        "triton": "triton",
+    }
+    return m.get(pkg.lower(), pkg.replace("-", "_"))
+
+def requirement_status(reqs):
+    missing = []
+    present = []
+    for pkg in reqs:
+        mod = import_name_for(pkg)
+        try:
+            importlib.import_module(mod)
+            present.append(pkg)
+        except Exception:
+            missing.append(pkg)
+    return present, missing
+
+def summarize_csv(csv_path: Path):
+    total = 0
+    by_mode = {}
+    by_label = {}
+    if not csv_path.exists():
+        return total, by_mode, by_label
+    with csv_path.open("r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            total += 1
+            by_mode[row.get("mode","")] = by_mode.get(row.get("mode",""), 0) + 1
+            by_label[row.get("label","")] = by_label.get(row.get("label",""), 0) + 1
+    return total, by_mode, by_label
+
+def disk_usage_info(path: Path):
+    """
+    Return (exists, total, used, free) for the filesystem hosting 'path'.
+    """
+    try:
+        usage = shutil.disk_usage(path if path.exists() else path.parent)
+        return True, usage.total, usage.used, usage.free
+    except Exception:
+        return False, None, None, None
+
+def same_device(a: Path, b: Path) -> bool | None:
+    """
+    Best-effort check if two paths are on the same device/volume.
+    On POSIX: compares st_dev; on Windows: compares drive letter root.
+    Returns True/False or None if unknown.
+    """
+    try:
+        if os.name == "nt":
+            return a.drive.lower() == b.drive.lower()
+        else:
+            return os.stat(a).st_dev == os.stat(b).st_dev
+    except Exception:
+        try:
+            if os.name == "nt":
+                return a.drive.lower() == b.drive.lower()
+        except Exception:
+            pass
         return None
 
-
-# ------------------------ recommendations --------------------------
-
-def recommend_batch_size(gpu, cpu) -> int:
-    """
-    Heuristic for grayscale 256x256, small CNN:
-    - Large VRAM -> larger batches
-    - CPU-only -> conservative based on RAM/cores
-    """
-    if gpu:
-        vram = gpu["total_mem"]
-        if vram >= 24 * 1024**3: return 128
-        if vram >= 16 * 1024**3: return 64
-        if vram >= 12 * 1024**3: return 48
-        if vram >=  8 * 1024**3: return 32
-        if vram >=  6 * 1024**3: return 24
-        if vram >=  4 * 1024**3: return 16
-        return 8
-    # CPU-only
-    cores = cpu["cores"]
-    avail = cpu["ram_avail"] or (8 * 1024**3)
-    if avail >= 32 * 1024**3 and cores >= 16: return 32
-    if avail >= 16 * 1024**3 and cores >= 8:  return 16
-    if avail >=  8 * 1024**3 and cores >= 4:  return 8
-    return 4
-
-def recommend_workers_prefetch(cores: int, rows: int) -> Tuple[int, int]:
-    """
-    General-purpose default:
-    - workers: clamp between 2 and 8 by cores
-    - prefetch: 2 for many workers; 4 if workers small or dataset small
-    """
-    workers = max(2, min(8, (cores // 2) or 1))
-    if rows < 200:
-        # tiny dataset: keep it simple
-        prefetch = 2
-        workers = max(2, min(workers, 4))
-    else:
-        prefetch = 2 if workers >= 4 else 4
-    return workers, prefetch
-
-def recommend_decode_cache_mb(avail_ram: int) -> int:
-    """
-    Allocate ~10% of available RAM, clamp to [256MB, 4096MB].
-    """
-    if not avail_ram:
-        return 512
-    rec = int(0.10 * (avail_ram / (1024*1024)))
-    rec = max(256, min(rec, 4096))
-    return rec
-
-def recommend_cache_max_bytes(free_disk_bytes: int) -> str:
-    """
-    Use ~40% of free space, clamp to [10GB, 200GB].
-    """
-    if not free_disk_bytes:
-        return "40GB"
-    target = int(0.40 * free_disk_bytes)
-    target = max(10 * 1024**3, min(target, 200 * 1024**3))
-    return _hb(target)
-
-def recommend_kfold(unique_groups: int) -> int:
-    """
-    Rule of thumb (by unique sha256 groups per mode):
-      >= 2000 -> 10
-      1000-1999 -> 8
-      500-999 -> 5
-      200-499 -> 4
-      100-199 -> 3
-      <100 -> 2  (or consider holdout if extremely tiny)
-    """
-    g = unique_groups
-    if g >= 2000: return 10
-    if g >= 1000: return 8
-    if g >=  500: return 5
-    if g >=  200: return 4
-    if g >=  100: return 3
-    return 2
-
-
-# ------------------------------ main --------------------------------
+# -------------- main --------------
 
 def main():
     print("=== VERIFY SETUP ===")
-    print(f"Python : {platform.python_version()} ({sys.executable})")
-    if torch is not None:
+    print(f"Python : {sys.version.split()[0]} ({sys.executable})")
+    # Torch/CUDA
+    try:
+        import torch
         print(f"PyTorch: {torch.__version__}")
-        print(f"CUDA   : {'available' if torch.cuda.is_available() else 'not available'}")
+    except Exception:
+        print("PyTorch: not installed")
+        torch = None
+
+    gpu = get_gpu_info()
+    if gpu["cuda_available"]:
+        mem_gb = bytes_to_gb(gpu["total_mem"]) if gpu["total_mem"] else "?"
+        print(f"CUDA   : available | GPU='{gpu['name']}' | VRAM={mem_gb} GB")
     else:
-        print("PyTorch: NOT INSTALLED (pip install torch)")
+        print("CUDA   : not available")
 
-    gpu = _gpu_info() if torch and torch.cuda.is_available() else None
-    if gpu:
-        print(f"GPU    : {gpu['name']}  VRAM={_hb(gpu['total_mem'])}")
+    # CPU + RAM
+    try:
+        import multiprocessing as mp
+        cores = mp.cpu_count()
+    except Exception:
+        cores = "?"
+    ram = get_ram_info()
+    if ram:
+        print(f"CPU    : cores={cores}")
+        print(f"RAM    : total={bytes_to_gb(ram['total'])} GB | available={bytes_to_gb(ram['available'])} GB")
+    else:
+        print(f"CPU    : cores={cores}")
+        print("RAM    : unknown (install psutil for detailed RAM)")
 
-    cpu = _cpu_info()
-    print(f"CPU    : cores={cpu['cores']}")
-    if cpu["ram_total"] is not None:
-        print(f"RAM    : total={_hb(cpu['ram_total'])}  avail≈{_hb(cpu['ram_avail'])}")
-
-    # Config paths
-    cfg = _read_cfg(Path("config.yaml"))
-    ti = cfg.get("train_io", {})
+    # Paths from config
+    cfg = load_yaml("config.yaml") or {}
     paths = cfg.get("paths", {})
-
-    data_csv = Path(ti.get("data_csv", "logs/conversion_log.csv"))
-    images_root = Path(ti.get("images_root", "dataset/output"))
-    cache_root = Path(paths.get("cache_root", "cache"))
+    ti    = cfg.get("train_io", {})
+    data_csv    = Path(ti.get("data_csv", paths.get("conversion_log", "logs/conversion_log.csv")))
+    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output"))).resolve()
+    cache_root  = Path(paths.get("cache_root", "cache")).resolve()
 
     print("\n--- Paths (from config or defaults) ---")
-    print(f"data_csv   : {data_csv}")
-    print(f"images_root: {images_root.resolve()}")
-    print(f"cache_root : {cache_root.resolve()}")
+    print(f"data_csv    : {data_csv}")
+    print(f"images_root : {images_root}")
+    print(f"cache_root  : {cache_root}")
 
-    # CSV summary
-    by_mode, by_mode_groups = _dataset_summary(data_csv)
-    total_rows = sum(by_mode.values()) if by_mode else 0
-    print("\n--- Dataset summary (from conversion_log.csv) ---")
-    if total_rows == 0:
-        print("No rows found (did you run conversion yet?).")
+    # Disk usage for images_root and cache_root
+    print("\n--- Disk usage (host volumes) ---")
+    img_exists, img_total, img_used, img_free = disk_usage_info(images_root)
+    cac_exists, cac_total, cac_used, cac_free = disk_usage_info(cache_root)
+    if img_exists:
+        print(f"images_root : total={bytes_to_gb(img_total)} GB | used={bytes_to_gb(img_used)} GB | free={bytes_to_gb(img_free)} GB")
     else:
-        print(f"Total rows: {total_rows}")
-        for m in ("compress", "truncate"):
-            n = by_mode.get(m, 0)
-            g = by_mode_groups.get(m, 0)
-            print(f"  {m:9s}: rows={n:6d} | unique_groups(sha256)={g}")
+        print("images_root : (volume not found; check path)")
+    if cac_exists:
+        print(f"cache_root  : total={bytes_to_gb(cac_total)} GB | used={bytes_to_gb(cac_used)} GB | free={bytes_to_gb(cac_free)} GB")
+    else:
+        print("cache_root  : (volume not found; check path)")
 
-    # Disk free for cache_root (if psutil available)
-    free_bytes = None
-    if psutil is not None:
-        du = _disk_free(cache_root)
-        if du:
-            free_bytes = du.free
-            print(f"\ncache_root free space: {_hb(du.free)} / total {_hb(du.total)}")
+    sd = same_device(images_root, cache_root)
+    if sd is True:
+        print("NOTE       : images_root and cache_root appear to be on the SAME device/volume.")
+        print("            Staging cache still helps (decode/prefetch), but copy speed gains may be limited.")
+    elif sd is False:
+        print("NOTE       : images_root and cache_root are on DIFFERENT devices (good for staging).")
+    else:
+        print("NOTE       : Could not determine if images_root and cache_root share the same device.")
 
-    # ---------------- Recommendations ----------------
+    # Dataset summary
+    print("\n--- Dataset summary (from conversion_log.csv) ---")
+    total, by_mode, by_label = summarize_csv(data_csv)
+    print(f"Total rows: {total}")
+    print(f"  modes   : {by_mode}")
+    print(f"  labels  : {by_label}")
+
+    # Requirements check
+    print("\n--- Requirements check ---")
+    reqs = parse_requirements("requirements.txt")
+    if not reqs:
+        print("requirements.txt not found or empty (skipping import test).")
+        present = []
+        missing = []
+    else:
+        present, missing = requirement_status(reqs)
+        if present:
+            print("present :", ", ".join(sorted(present)))
+        if missing:
+            print("missing :", ", ".join(sorted(missing)))
+            print("Hint    : pip install -r requirements.txt")
+
+    # ---------------- SPEED & CACHE RECOMMENDATIONS ----------------
     print("\n=== RECOMMENDATIONS (copy into config.yaml) ===")
 
-    # batch_size
-    bs = recommend_batch_size(gpu, cpu)
-    print("training.batch_size:", bs)
-
-    # workers & prefetch (use total rows to guess)
-    workers, prefetch = recommend_workers_prefetch(cpu["cores"], total_rows)
-    print("training.num_workers:", workers)
-    print("training.prefetch_batches:", prefetch)
-    print("training.use_disk_cache: true")  # good default for consistent staging
-
-    # decode cache (RAM)
-    dec_mb = recommend_decode_cache_mb(cpu["ram_avail"])
-    print("training.decode_cache_mem_mb:", dec_mb)
-
-    # cache size on disk
-    cache_cap = recommend_cache_max_bytes(free_bytes)
-    print("paths.cache_max_bytes:", cache_cap)
-
-    # kfold per mode (choose the smaller of the two mode-based recs so both are feasible)
-    if total_rows > 0:
-        k1 = recommend_kfold(by_mode_groups.get("compress", 0))
-        k2 = recommend_kfold(by_mode_groups.get("truncate", 0))
-        k = min(max(2, k1), max(2, k2)) if (k1 and k2) else max(k1 or 0, k2 or 0, 2)
-        print("training.kfold:", k)
+    # Batch size heuristic (single-channel 256x256):
+    # Larger VRAM -> larger batch; CPU-only -> small/moderate.
+    if gpu["cuda_available"] and gpu["total_mem"]:
+        vram_gb = gpu["total_mem"] / (1024**3)
+        if vram_gb < 4.5:
+            bs = 32
+        elif vram_gb < 9:
+            bs = 64
+        elif vram_gb < 13:
+            bs = 96
+        else:
+            bs = 128
     else:
-        print("training.kfold: 5  # (default suggestion; adjust after you have data)")
+        bs = 12 if ram and ram["available"] > 8*(1024**3) else 8
 
+    # Workers/prefetch tuned by CPU cores and RAM
+    if isinstance(cores, int):
+        nw = max(2, min(12, cores // 2))
+    else:
+        nw = 4
+
+    if ram and ram["available"] >= 8*(1024**3):
+        prefetch = 4
+        decode_mb = 1024
+    else:
+        prefetch = 2
+        decode_mb = 512
+
+    pin_mem = True if (gpu["cuda_available"]) else False
+    persistent = True if nw > 0 else False
+    amp = True if gpu["cuda_available"] else False
+
+    # Cache sizing from *free space* at cache_root
+    cache_cap_str = "40GB"
+    use_disk_cache = True
+    if cac_exists and cac_free is not None:
+        # If free space is tiny, recommend disabling disk cache to avoid churn
+        if cac_free < 8*(1024**3):  # < 8 GB free
+            use_disk_cache = False
+            cache_cap_str = "0GB"
+        else:
+            # use ~30% of free space, minimum 10 GB, capped at total
+            suggest_bytes = int(cac_free * 0.30)
+            suggest_gb = max(10, suggest_bytes // (1024**3))
+            # never exceed total
+            if cac_total:
+                suggest_gb = min(suggest_gb, max(1, int(cac_total // (1024**3)) - 4))  # keep 4GB headroom
+            cache_cap_str = f"{suggest_gb}GB"
+    else:
+        # Unknown volume; conservative default
+        use_disk_cache = True
+        cache_cap_str = "40GB"
+
+    print("training.batch_size:", bs)
+    print("training.num_workers:", nw)
+    print("training.prefetch_batches:", prefetch)
+    print("training.pin_memory:", str(pin_mem).lower())
+    print("training.persistent_workers:", str(persistent).lower())
+    print("training.amp:", str(amp).lower())
+    print(f"training.use_disk_cache: {str(use_disk_cache).lower()}")
+    print(f"training.decode_cache_mem_mb: {decode_mb}")
+    print(f"paths.cache_max_bytes: {cache_cap_str}")
+
+    # Extra human notes
     print("\nNotes:")
-    print("- batch_size is constrained by GPU VRAM (or CPU RAM if no GPU).")
-    print("- num_workers are background loader processes; persistent workers + prefetch keep batches ready.")
-    print("- decode_cache_mem_mb limits in-RAM decoded PNG tensors; increase on big-memory desktop.")
-    print("- cache_max_bytes caps SSD staging cache; keep it below ~50% of free SSD space.")
-    print("- kfold uses unique sha256 counts; we picked a conservative value that fits both modes.")
-
+    print("- Batch size increases GPU utilization until you hit OOM; then back off.")
+    print("- num_workers/prefetch keep the pipeline fed; tune with CPU cores and RAM.")
+    print("- pin_memory+persistent_workers reduce H2D latency on CUDA.")
+    print("- decode_cache_mem_mb is an in-RAM budget for decoded PNG tensors; raise on big-RAM hosts.")
+    print("- paths.cache_max_bytes is sized from FREE space on the cache volume (~30% by default).")
+    if sd is True:
+        print("- Cache and dataset on SAME device: staging still helps decode/prefetch, but copy benefits are smaller.")
+    elif sd is False:
+        print("- Cache and dataset on DIFFERENT devices: good for I/O parallelism; keep cache_root on an SSD if possible.")
+    if missing:
+        print("- Install missing requirements to avoid slow fallbacks/import errors.")
 
 if __name__ == "__main__":
     main()
-

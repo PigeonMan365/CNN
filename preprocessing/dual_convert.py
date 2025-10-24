@@ -1,50 +1,79 @@
+#!/usr/bin/env python3
 """
-dual_convert.py
-- Runs BOTH conversion modes over everything it finds in paths.input_roots.
-- By default, processes all discovered files (no limit).
-- Simply orchestrates converter.py twice (truncate, then compress).
-- Paths come from config.yaml; no hardcoded defaults.
+Dual-mode converter (compress + truncate), OS-agnostic and limit-free.
+
+- Reads paths.input_roots (list) and paths.images_root from config.yaml
+- Walks <input_root>/{benign,malware}/
+- For each file, writes PNGs to: images_root/<mode>/<label>/<sha256>.png
+- Does NOT write conversion_log.csv; main.py rebuilds from disk afterwards.
 """
 
-# --- add this block near the top of the file ---
-import sys
 from pathlib import Path
-ROOT = Path(__file__).resolve().parents[1]  # project root
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-# -----------------------------------------------
-
-import argparse
-import subprocess
 import sys
-from utils.paths import load_config
 
+# ---- Robust import for convert_file regardless of how this script is invoked ----
+# Try package import first, then local fallback after adding this folder to sys.path.
+try:
+    from preprocessing.converter import convert_file  # when imported as a package
+except Exception:
+    THIS_DIR = Path(__file__).resolve().parent
+    if str(THIS_DIR) not in sys.path:
+        sys.path.insert(0, str(THIS_DIR))
+    from converter import convert_file  # when run as a script
 
-def run(cmd):
-    print("> " + " ".join(cmd), flush=True)
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        sys.exit(r.returncode)
+try:
+    import yaml
+except Exception:
+    yaml = None
 
+LABELS = ("benign", "malware")
+MODES = ("compress", "truncate")
+
+def load_cfg(path="config.yaml"):
+    if yaml is None:
+        print("[dual_convert] PyYAML not installed. pip install pyyaml", file=sys.stderr)
+        sys.exit(2)
+    p = Path(path)
+    if not p.exists():
+        print(f"[dual_convert] Missing {path}", file=sys.stderr)
+        sys.exit(2)
+    return yaml.safe_load(p.read_text())
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Run both compress and truncate conversions over input_roots (no filtering)."
-    )
-    ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--limit", type=int, default=0, help="Process at most N files (0 = no limit)")
-    args = ap.parse_args()
+    cfg = load_cfg("config.yaml")
+    paths = cfg.get("paths", {})
+    input_roots = paths.get("input_roots", ["dataset/input"])
+    images_root = Path(paths.get("images_root", "dataset/output")).resolve()
+    images_root.mkdir(parents=True, exist_ok=True)
 
-    # Validate config exists/parsable (also normalizes paths)
-    _ = load_config(args.config)
+    # pre-scan: show how many inputs we actually see
+    found = {("benign", r): 0 for r in input_roots} | {("malware", r): 0 for r in input_roots}
+    for in_root in input_roots:
+        base = Path(in_root).resolve()
+        for label in LABELS:
+            src_dir = base / label
+            if src_dir.exists():
+                found[(label, in_root)] = sum(1 for f in src_dir.iterdir() if f.is_file())
+    print("[dual_convert] input file counts:")
+    for (label, root), n in found.items():
+        print(f"  {label:7s} @ {root}: {n}")
 
-    # Run truncate then compress to populate images_root and conversion_log
-    for mode in ("truncate", "compress"):
-        cmd = [sys.executable, "preprocessing/converter.py", "--config", args.config, "--mode", mode]
-        if args.limit and args.limit > 0:
-            cmd += ["--limit", str(args.limit)]
-        run(cmd)
+    total = 0
+    for in_root in input_roots:
+        base = Path(in_root).resolve()
+        for label in LABELS:
+            src_dir = base / label
+            if not src_dir.exists():
+                continue
+            for f in src_dir.iterdir():
+                if not f.is_file():
+                    continue
+                for mode in MODES:
+                    out = convert_file(f, mode, images_root, label)
+                    if out is not None:
+                        total += 1
 
+    print(f"[dual_convert] Wrote {total} PNGs under {images_root}")
 
 if __name__ == "__main__":
     main()
