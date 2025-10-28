@@ -1,56 +1,61 @@
-# MalNet-FocusAug configuration (paths must be set explicitly; no hardcoded defaults)
-
+# MalNet-FocusAug configuration (cleaned & complete)
+# --------------------------------------------------
 paths:
-  # VM-side binary conversion I/O
-  input_roots: ["dataset/input"]          # REQUIRED: list of directories to scan for raw binaries (e.g., ["/vault/malware/input", "dataset/input"])
-  images_root: "dataset/output"          # REQUIRED: directory to write converted PNGs (e.g., "/vault/malware/output" or "dataset/output")
-  logs_root: "logs"            # REQUIRED: directory for logs (e.g., "/vault/malware/logs" or "logs")
-  conversion_log: "logs/conversion_log.csv"       # REQUIRED: unified manifest CSV path (e.g., "/vault/malware/logs/conversion_log.csv")
-  tmp_root: "tmp"             # REQUIRED: temp workspace for safe binary copies (VM-only)
-  cache_root: "cache"           # REQUIRED: SSD cache root for staging (used by preprocessing/training if enabled)
-  cache_max_bytes: "66GB" # default cap you chose
+  input_roots: ["dataset/input"]
+  images_root: "dataset/output"
+  logs_root: "logs"
+  conversion_log: "logs/conversion_log.csv"
+  tmp_root: "tmp"
+  cache_root: "cache"
+  cache_max_bytes: "10GB"
 
 train_io:
-  # Desktop-side training I/O
-  data_csv: "logs/conversion_log.csv"             # REQUIRED: path to conversion_log.csv on the training host
-  images_root: "dataset/output"          # REQUIRED: where PNGs live on the training host
-  runs_root: "runs"            # REQUIRED: parent directory for all run artifacts (each run gets its own subdir)
-  run_index: "logs/index.csv"            # REQUIRED: path to a CSV registry of all runs (e.g., "logs/index.csv")
-  checkpoints_root: ""     # optional override; if empty -> runs_root/<run_id>/checkpoints
-  tensorboard_root: ""     # optional override; if empty -> runs_root/<run_id>/tb
-
-model:
-  channels: [32, 64, 128]  # three residual stages (two convs each), as specified
-  attention: true          # mandatory attention branch per your spec
+  data_csv: "logs/conversion_log.csv"
+  images_root: "dataset/output"
+  runs_root: "runs"
+  run_index: "logs/run_index.json"
+  checkpoints_root: null
+  tensorboard_root: null
 
 training:
-  torch_compile: false
-  amp: true                # mixed precision if GPU available
+  # ===== Metrics & operating point =====
+  metrics:
+    primary_global: pr_auc         # or roc_auc
+    operating_point:
+      type: fpr_budget
+      value: 0.001                 # 0.1% FPR
+
+  # ===== Splits =====
+  kfold: 3
+  holdout: 20                      # used when kfold == 1
+
+  # ===== Batching & imbalance =====
+  batch_size: 8
+  oversample_pos_range: "0.05-0.10"  # ≈1:19...1:9 positives per batch
+
+  # ===== Optimizer & schedule =====
+  optimizer: adamw                 # adam | adamw
+  scheduler: onecycle              # none | onecycle
+  max_lr: auto                     # "auto" or a float
   weight_decay: 0.0001
   grad_clip: 1.0
-  optimizer: "adamw"
-  scheduler: "onecycle"
-  max_lr: "auto"           # auto-tuned baseline
-  mode: compress        # compress or truncate
-  batch_size: 64   # set from verify_setup suggestion; try 8–32 on GPU, 4–16 on CPU
-  use_disk_cache: true         # stage files from HDD to SSD cache
-  pin_memory: true
+
+  # ===== Performance =====
+  epochs: 3                        # <— correct key; trainer reads this
+  num_workers: 4                   # trainer will force 0 on Windows automatically
+  prefetch_batches: 2
+  pin_memory: false
   persistent_workers: true
-  prefetch_batches: 4          # DataLoader prefetch_factor (per worker)
-  num_workers: 4               # tune per machine (CPU cores / 2 is a decent start)
-  decode_cache_mem_mb: 1024     # in-RAM decoded tensor cache budget (~512MB)
-  holdout: 20
-  kfold: 4
-  epochs: 4               # tune later
+  amp: false
+  device: auto                     # auto | cpu | cuda
+  default_mode: compress  # or truncate, otherwise defaults to both
 
 
-sampler:
-  type: "sharded"          # resumable, deterministic, scale-friendly
-  shard_size: 100000
-  shuffle_seed: 42
+  # ===== Optional compile =====
+  torch_compile: false
 
-checkpoint:
-  mini_every_batches: 200  # target ~10 minutes between minis; adjust after first run
-  keep_last_k: 3
-  save_rng_state: true
-  save_scheduler: true
+  # ===== Resume knob (future) =====
+  allow_resume: true
+
+  # ===== Exports =====
+  export_root: "export_models"

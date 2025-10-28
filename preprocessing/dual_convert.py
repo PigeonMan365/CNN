@@ -44,6 +44,7 @@ def main():
     paths = cfg.get("paths", {})
     input_roots = paths.get("input_roots", ["dataset/input"])
     images_root = Path(paths.get("images_root", "dataset/output")).resolve()
+    input_root.mkdir(parents=True, exist_ok=True)
     images_root.mkdir(parents=True, exist_ok=True)
 
     # pre-scan: show how many inputs we actually see

@@ -1,579 +1,740 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-High-performance trainer for MalNet-FocusAug.
-
-- Config-first: reads training values from config.yaml (no hidden hardcoded defaults).
-- CLI overrides: --epochs, --kfold, --mode, --seed.
-- Auto-increment seed per mode if --seed not provided (logs/seed_counters.json).
-- Group-aware K-Fold by sha256 (sklearn GroupKFold if available).
-- CUDA optimizations: AMP (new API), cudnn.benchmark, TF32, channels_last, non-blocking H2D.
-- DataLoader optimizations: persistent_workers, pin_memory, prefetch_factor, num_workers.
-- Optional torch.compile (only if training.torch_compile:true AND Triton present; disabled on Windows).
-- Exports TorchScript to export_models/ with monotonically increasing iteration per mode.
-
-Saved filename: export_models/cnn_<mode>_<seed>_<iter>.ts.pt
+Trainer for MalNet-FocusAug — Option A (best single fold export)
+- Config-driven defaults with CLI override
+- Grouped+stratified folds (by sha256, label)
+- Mild positive oversampling per batch (≈5–10% positives ≈ 1:19–1:9)
+- Metrics: PR-AUC (primary), ROC-AUC, max-F1, F1 at operating point
+- Operating point chosen by FPR budget
+- Per-fold best checkpointing by PR-AUC; export best fold as TorchScript
+- Safe interrupt + resume: writes runstate.json and fold{N}_interrupt.pt; supports --resume
+- Windows-safe dataloading (num_workers=0, no persistent workers)
 """
 
 from __future__ import annotations
-import argparse
-import contextlib
-import csv
-import json
-import math
-import os
-import platform
-import random
-from dataclasses import dataclass, fields
+import argparse, csv, json, math, os, random, signal, sys, platform
+from dataclasses import dataclass, asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
+from tqdm.auto import tqdm
 
-# Robust imports for layout
-try:
-    from training.dataset import ByteImageDataset
-except Exception:
-    from dataset import ByteImageDataset
-try:
-    from training.model import MalNetFocusAug
-except Exception:
-    from model import MalNetFocusAug
-
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-try:
-    from tqdm import tqdm
-except Exception:
-    def tqdm(x, **kwargs): return x  # minimal fallback
+import torch.nn.functional as F
+from torch import optim
+from torch.utils.data import DataLoader, Subset, BatchSampler
+
+# ---------- Robust imports for dataset/model (avoid folder collisions) ----------
+import importlib.util as _ilu
+from importlib import import_module as _import
+
+_HERE = Path(__file__).resolve().parent
+
+def _dyn_import(candidates, attr):
+    for fp in candidates:
+        if fp.exists():
+            spec = _ilu.spec_from_file_location(fp.stem, fp)
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return getattr(mod, attr)
+    # fallbacks to package imports if available
+    for name in ["dataset", "training.dataset", "model", "training.model"]:
+        try:
+            mod = _import(name)
+            if hasattr(mod, attr):
+                return getattr(mod, attr)
+        except Exception:
+            continue
+    raise ImportError(f"Could not import {attr} from candidates: {candidates}")
+
+ByteImageDataset = _dyn_import([_HERE / "dataset.py", _HERE / "training" / "dataset.py"], "ByteImageDataset")
+MalNetFocusAug  = _dyn_import([_HERE / "model.py",   _HERE / "training" / "model.py"],   "MalNetFocusAug")
+
+# ---------- Metrics utils ----------
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+from sklearn.utils import check_random_state
 
 
-# ----------------- Config helpers -----------------
+# ---------- Config loader ----------
+def _load_config_dict() -> Dict:
+    # Preferred: project helper if available
+    try:
+        from utils.paths import load_config as _load_config
+        cfg = _load_config()
+        if hasattr(cfg, 'get'):
+            return cfg
+        if hasattr(cfg, '__dict__'):
+            return dict(cfg.__dict__)
+    except Exception:
+        pass
+    # Fallback: read ./config.yaml using PyYAML if present
+    cfg_path = _HERE / "config.yaml"
+    if cfg_path.exists():
+        try:
+            import yaml
+            with cfg_path.open("r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    return {}
 
+
+def _get(d: Dict, path: str, default=None):
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+# ---------- CLI ----------
 @dataclass
-class TrainCfg:
-    epochs: int = 5
-    batch_size: int = 24
-    amp: bool = True
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
-    optimizer: str = "adamw"
-    scheduler: str = "onecycle"
-    max_lr: str|float = "auto"
-    mode: str = "compress"
+class TrainArgs:
+    data_csv: str
+    images_root: str
+    mode: str
+    seed: int = 0
+    epochs: int = 10
+    batch_size: int = 32
     num_workers: int = 4
     prefetch_batches: int = 2
-    pin_memory: bool = True
+    pin_memory: bool = False
     persistent_workers: bool = True
+    device: str = "auto"
     kfold: int = 5
-    holdout: int|float = 0
-    use_disk_cache: bool = False
-    decode_cache_mem_mb: int = 0
-    torch_compile: bool = False
+    holdout: int = 0
+    resume: bool = False
+    fpr_budget: float = 0.001
+    oversample_pos_min: float = 0.05
+    oversample_pos_max: float = 0.10
+    optimizer: str = "adamw"
+    scheduler: str = "onecycle"
+    max_lr: str = "auto"
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    amp: bool = False
+    runs_root: str = "runs"
+    export_root: str = "export_models"
 
-def cfg_from_yaml(training_sec: dict) -> TrainCfg:
-    """
-    Build TrainCfg using only keys present in config.yaml's 'training' section.
-    Falls back to dataclass defaults when a key is missing.
-    """
-    tc = TrainCfg()
-    if not isinstance(training_sec, dict):
-        return tc
-    name_to_field = {f.name: f for f in fields(TrainCfg)}
-    for k, v in training_sec.items():
-        if k in name_to_field:
-            typ = name_to_field[k].type
-            try:
-                if typ is bool:
-                    setattr(tc, k, bool(v))
-                elif typ is int:
-                    setattr(tc, k, int(v))
-                elif typ is float:
-                    setattr(tc, k, float(v))
-                else:
-                    setattr(tc, k, v)
-            except Exception:
-                setattr(tc, k, v)
-    return tc
 
-def load_yaml_cfg(path="config.yaml") -> dict:
+def parse_cli() -> TrainArgs:
+    p = argparse.ArgumentParser(description="Train MalNet-FocusAug")
+    p.add_argument("--data-csv", required=True)
+    p.add_argument("--images-root", required=True)
+    p.add_argument("--mode", required=True, choices=["compress", "truncate"])
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--prefetch-batches", type=int, default=None)
+    p.add_argument("--pin-memory", action="store_true")
+    p.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
+    p.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
+    p.add_argument("--kfold", type=int, default=None)
+    p.add_argument("--holdout", type=int, default=None)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--fpr-budget", type=float, default=None)
+    p.add_argument("--oversample-pos-range", type=str, default=None)
+    p.add_argument("--optimizer", default=None, choices=["adam", "adamw"])
+    p.add_argument("--scheduler", default=None, choices=["none", "onecycle"])
+    p.add_argument("--max-lr", default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--runs-root", default=None)
+    p.add_argument("--export-root", default=None)
+    a = p.parse_args()
+
+    args = TrainArgs(
+        data_csv=a.data_csv,
+        images_root=a.images_root,
+        mode=a.mode,
+    )
+    return args, a
+
+
+def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
+    cfg = _load_config_dict()
+
+    # paths
+    data_csv = _get(cfg, "train_io.data_csv", args.data_csv) or args.data_csv
+    images_root = _get(cfg, "train_io.images_root", args.images_root) or args.images_root
+    runs_root = _get(cfg, "train_io.runs_root", args.runs_root) or args.runs_root
+    export_root = _get(cfg, "training.export_root", args.export_root) or args.export_root
+
+    # training defaults
+    epochs = _get(cfg, "training.epochs", _get(cfg, "training.epoch", args.epochs))
+    batch_size = _get(cfg, "training.batch_size", args.batch_size)
+    num_workers = _get(cfg, "training.num_workers", args.num_workers)
+    prefetch_batches = _get(cfg, "training.prefetch_batches", args.prefetch_batches)
+    pin_memory = bool(_get(cfg, "training.pin_memory", args.pin_memory))
+    persistent_workers = bool(_get(cfg, "training.persistent_workers", args.persistent_workers))
+    kfold = _get(cfg, "training.kfold", args.kfold)
+    holdout = _get(cfg, "training.holdout", args.holdout)
+    optimizer = _get(cfg, "training.optimizer", args.optimizer)
+    scheduler = _get(cfg, "training.scheduler", args.scheduler)
+    max_lr = str(_get(cfg, "training.max_lr", args.max_lr))
+    weight_decay = float(_get(cfg, "training.weight_decay", args.weight_decay))
+    grad_clip = float(_get(cfg, "training.grad_clip", args.grad_clip))
+    amp = bool(_get(cfg, "training.amp", args.amp))
+    device = _get(cfg, "training.device", args.device) or args.device
+
+    # operating point
+    op_type = _get(cfg, "training.metrics.operating_point.type", "fpr_budget")
+    op_value = _get(cfg, "training.metrics.operating_point.value", args.fpr_budget)
+    fpr_budget = float(op_value) if op_type == "fpr_budget" else args.fpr_budget
+
+    # oversampling (string like "0.05-0.10")
+    osr = _get(cfg, "training.oversample_pos_range", f"{args.oversample_pos_min}-{args.oversample_pos_max}")
     try:
-        import yaml
+        mn, mx = str(osr).split("-")
+        oversample_pos_min, oversample_pos_max = float(mn), float(mx)
     except Exception:
-        return {}
-    p = Path(path)
-    if not p.exists():
-        return {}
-    try:
-        return yaml.safe_load(p.read_text())
-    except Exception:
-        return {}
+        oversample_pos_min, oversample_pos_max = args.oversample_pos_min, args.oversample_pos_max
 
-def set_all_seeds(seed: int):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    # helper choose
+    def choose(val_cfg, val_cli, val_def):
+        return val_cli if (val_cli is not None and val_cli != "") else (val_cfg if val_cfg is not None else val_def)
+
+    args = replace(
+        args,
+        data_csv=choose(data_csv, raw_cli.data_csv, args.data_csv),
+        images_root=choose(images_root, raw_cli.images_root, args.images_root),
+        seed=choose(_get(cfg, "training.seed", args.seed), raw_cli.seed, args.seed),
+        epochs=choose(epochs, raw_cli.epochs, args.epochs),
+        batch_size=choose(batch_size, raw_cli.batch_size, args.batch_size),
+        num_workers=choose(num_workers, raw_cli.num_workers, args.num_workers),
+        prefetch_batches=choose(prefetch_batches, raw_cli.prefetch_batches, args.prefetch_batches),
+        pin_memory=True if raw_cli.pin_memory else pin_memory,
+        persistent_workers=choose(persistent_workers, raw_cli.persistent_workers, args.persistent_workers),
+        device=choose(device, raw_cli.device, args.device),
+        kfold=choose(kfold, raw_cli.kfold, args.kfold),
+        holdout=choose(holdout, raw_cli.holdout, args.holdout),
+        resume=True if raw_cli.resume else args.resume,
+        fpr_budget=choose(fpr_budget, raw_cli.fpr_budget, args.fpr_budget),
+        optimizer=choose(optimizer, raw_cli.optimizer, args.optimizer),
+        scheduler=choose(scheduler, raw_cli.scheduler, args.scheduler),
+        max_lr=choose(max_lr, raw_cli.max_lr, args.max_lr),
+        weight_decay=choose(weight_decay, None, args.weight_decay),
+        grad_clip=choose(grad_clip, raw_cli.grad_clip, args.grad_clip),
+        amp=True if raw_cli.amp else amp,
+        runs_root=choose(runs_root, raw_cli.runs_root, args.runs_root),
+        export_root=choose(export_root, raw_cli.export_root, args.export_root),
+        oversample_pos_min=oversample_pos_min,
+        oversample_pos_max=oversample_pos_max,
+    )
+
+    tr_cfg = _get(cfg, "training", {})
+    if isinstance(tr_cfg, dict) and len(tr_cfg) > 0:
+        print("[CONFIG] training section loaded from config.yaml:")
+        print("  " + json.dumps(tr_cfg, indent=2))
+    return args
+
+
+# ---------- helpers ----------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def csv_mode_counts(csv_path: Path) -> Tuple[Dict[str, int], Dict[str, int], int]:
-    mode_ct: Dict[str, int] = {}
-    label_ct: Dict[str, int] = {}
-    total = 0
-    with csv_path.open("r", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            total += 1
-            mode_ct[row.get("mode","")] = mode_ct.get(row.get("mode",""), 0) + 1
-            label_ct[row.get("label","")] = label_ct.get(row.get("label",""), 0) + 1
-    return mode_ct, label_ct, total
 
-def read_csv_rows(csv_path: Path) -> List[dict]:
-    rows = []
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+# ---------- CSV ----------
+def read_filtered_rows(csv_path: Path, mode: str) -> List[Dict]:
+    rows: List[Dict] = []
     with csv_path.open("r", newline="") as f:
         r = csv.DictReader(f)
+        need = {"rel_path", "label", "mode", "sha256"}
+        if not need.issubset(set(r.fieldnames or [])):
+            raise ValueError(f"{csv_path} missing columns; need {sorted(need)}")
         for row in r:
-            rows.append(row)
+            if row["mode"].strip().lower() != mode:
+                continue
+            rows.append({
+                "rel_path": row["rel_path"].strip(),
+                "label": 1 if str(row["label"]).strip() in ("1", "malware") else 0,
+                "sha256": (row.get("sha256") or "").strip() or f"nog_{len(rows)}"
+            })
     return rows
 
-def write_csv_rows(csv_path: Path, rows: List[dict]):
-    if not rows:
-        return
-    cols = list(rows[0].keys())
-    with csv_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        w.writerows(rows)
 
-def filter_by_mode(rows: List[dict], mode: str) -> List[dict]:
-    return [r for r in rows if str(r.get("mode","")).lower() == mode.lower()]
+# ---------- Folds ----------
+def build_grouped_stratified_folds(rows: List[Dict], k: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    rng = check_random_state(seed)
+    groups: Dict[str, Dict] = {}
+    for i, r in enumerate(rows):
+        g = r["sha256"]; y = int(r["label"])
+        groups.setdefault(g, {"idxs": [], "label": 0})
+        groups[g]["idxs"].append(i)
+        groups[g]["label"] = max(groups[g]["label"], y)
 
-def group_hashes(rows: List[dict]) -> List[str]:
-    return [r.get("sha256","") for r in rows]
+    pos = [(g, v) for g, v in groups.items() if v["label"] == 1]
+    neg = [(g, v) for g, v in groups.items() if v["label"] == 0]
+    rng.shuffle(pos); rng.shuffle(neg)
 
-def auto_lr(max_lr_cfg: str|float, batch_size: int) -> float:
-    if isinstance(max_lr_cfg, (int, float)):
-        return float(max_lr_cfg)
-    # mild scaling with batch size
-    base = 1e-3
-    return base * (batch_size / 32.0)**0.5
+    folds = [{"p": 0, "n": 0, "idxs": []} for _ in range(k)]
+    for g, v in pos:
+        j = min(range(k), key=lambda fi: folds[fi]["p"]); folds[j]["p"] += 1; folds[j]["idxs"].extend(v["idxs"])
+    for g, v in neg:
+        j = min(range(k), key=lambda fi: folds[fi]["n"]); folds[j]["n"] += 1; folds[j]["idxs"].extend(v["idxs"])
 
-def try_torch_compile(model: nn.Module, enable_flag: bool) -> nn.Module:
-    if not enable_flag:
-        return model
-    # Avoid on Windows by default (Triton wheels often unavailable)
-    if platform.system().lower() == "windows":
-        print("[compile] Skipping torch.compile on Windows.")
-        return model
-    # Require Triton
+    N = len(rows)
+    all_idx = np.arange(N, dtype=int)
+    splits = []
+    for fi in range(k):
+        val_idx = np.array(sorted(folds[fi]["idxs"]), dtype=int)
+        mask = np.ones(N, dtype=bool); mask[val_idx] = False
+        train_idx = all_idx[mask]
+        splits.append((train_idx, val_idx))
+    return splits
+
+
+def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    assert 0 <= holdout_pct <= 50
+    rng = check_random_state(seed)
+    groups: Dict[str, Dict] = {}
+    for i, r in enumerate(rows):
+        g = r["sha256"]; y = int(r["label"])
+        groups.setdefault(g, {"idxs": [], "label": 0})
+        groups[g]["idxs"].append(i)
+        groups[g]["label"] = max(groups[g]["label"], y)
+    glist = list(groups.items()); rng.shuffle(glist)
+    N = len(rows); target = int(round(N * (holdout_pct / 100.0)))
+    val_idxs = []
+    for _, v in glist:
+        if len(val_idxs) >= target:
+            break
+        val_idxs.extend(v["idxs"])
+    val_idx = np.array(sorted(val_idxs), dtype=int)
+    mask = np.ones(N, dtype=bool); mask[val_idx] = False
+    train_idx = np.arange(N, dtype=int)[mask]
+    return [(train_idx, val_idx)]
+
+
+# ---------- Mild positive oversampling ----------
+class StratifiedRatioBatchSampler(BatchSampler):
+    def __init__(self, labels: np.ndarray, batch_size: int, pos_min: float, pos_max: float, seed: int):
+        assert 0.0 < pos_min <= pos_max < 0.5
+        self.labels = labels.astype(int)
+        self.batch_size = int(batch_size)
+        self.pos_min = float(pos_min)
+        self.pos_max = float(pos_max)
+        self.rng = random.Random(seed)
+        self.pos_pool = [i for i, y in enumerate(self.labels) if y == 1]
+        self.neg_pool = [i for i, y in enumerate(self.labels) if y == 0]
+        if not self.pos_pool or not self.neg_pool:
+            raise ValueError("Both classes are required for stratified batch sampling.")
+        self._shuffle()
+
+    def _shuffle(self):
+        self.rng.shuffle(self.pos_pool)
+        self.rng.shuffle(self.neg_pool)
+        self._pi = 0
+        self._ni = 0
+
+    def __iter__(self):
+        self._shuffle()
+        total = len(self.labels); emitted = 0
+        while emitted < total:
+            target = self.rng.uniform(self.pos_min, self.pos_max)
+            k_pos = max(1, min(len(self.pos_pool), int(round(target * self.batch_size))))
+            k_neg = self.batch_size - k_pos
+            batch = []
+            for _ in range(k_pos):
+                if self._pi >= len(self.pos_pool):
+                    self._pi = 0
+                batch.append(self.pos_pool[self._pi]); self._pi += 1
+            for _ in range(k_neg):
+                if self._ni >= len(self.neg_pool):
+                    self._ni = 0
+                batch.append(self.neg_pool[self._ni]); self._ni += 1
+            self.rng.shuffle(batch)
+            emitted += len(batch)
+            yield batch
+
+    def __len__(self):
+        return math.ceil(len(self.labels) / self.batch_size)
+
+
+# ---------- Metrics ----------
+def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -> Dict[str, float]:
+    y_true = labels.astype(int)
+    y_score = scores.astype(float)
     try:
-        import triton  # noqa: F401
+        roc_auc = roc_auc_score(y_true, y_score)
     except Exception:
-        print("[compile] Triton not found; running eager.")
-        return model
-    if hasattr(torch, "compile"):
-        try:
-            print("[compile] Enabling torch.compile (inductor).")
-            return torch.compile(model, mode="reduce-overhead", fullgraph=False)
-        except Exception as e:
-            print(f"[compile] Disabled (reason: {e.__class__.__name__}). Falling back to eager.")
-            return model
-    return model
-
-def load_json(p: Path, default):
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            return default
-    return default
-
-def save_json(p: Path, obj):
-    ensure_dir(p.parent)
-    p.write_text(json.dumps(obj, indent=2))
-
-def next_seed_for_mode(mode: str, override: int|None) -> int:
-    """
-    If override is provided (CLI --seed), use that.
-    Else auto-increment per-mode seed counter in logs/seed_counters.json.
-    """
-    if override is not None:
-        return int(override)
-    meta_path = Path("logs/seed_counters.json")
-    meta = load_json(meta_path, {})
-    cur = int(meta.get(mode, -1))  # start from -1 so first becomes 0
-    nxt = cur + 1
-    meta[mode] = nxt
-    save_json(meta_path, meta)
-    return nxt
-
-def next_export_iter_for_mode(mode: str) -> int:
-    meta_path = Path("logs/export_iters.json")
-    meta = load_json(meta_path, {})
-    cur = int(meta.get(mode, 0))
-    meta[mode] = cur + 1
-    save_json(meta_path, meta)
-    return cur  # return current for naming
-
-
-# ----------------- Data classes -----------------
-
-@dataclass
-class TrainCfg:
-    epochs: int = 5
-    batch_size: int = 24
-    amp: bool = True
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
-    optimizer: str = "adamw"
-    scheduler: str = "onecycle"
-    max_lr: str|float = "auto"
-    mode: str = "compress"
-    num_workers: int = 4
-    prefetch_batches: int = 2
-    pin_memory: bool = True
-    persistent_workers: bool = True
-    kfold: int = 5
-    holdout: int|float = 0  # unused here
-    use_disk_cache: bool = False
-    decode_cache_mem_mb: int = 0
-    torch_compile: bool = False  # opt-in
-
-
-def load_yaml_cfg(path="config.yaml") -> dict:
-    from pathlib import Path
-    p = Path(path)
-    if not p.exists():
-        print(f"[CONFIG] WARNING: {p.resolve()} not found. Using TrainCfg defaults.")
-        return {}
+        roc_auc = float("nan")
     try:
-        import yaml
+        pr_auc = average_precision_score(y_true, y_score)
     except Exception:
-        print(f"[CONFIG] WARNING: PyYAML not installed; cannot parse {p.resolve()}. Using TrainCfg defaults.")
-        return {}
-    try:
-        cfg = yaml.safe_load(p.read_text())
-        if not isinstance(cfg, dict):
-            print(f"[CONFIG] WARNING: {p.resolve()} did not parse to a dict. Using TrainCfg defaults.")
-            return {}
-        return cfg
-    except Exception as e:
-        print(f"[CONFIG] WARNING: Failed to parse {p.resolve()} ({type(e).__name__}: {e}). Using TrainCfg defaults.")
-        return {}
+        pr_auc = float("nan")
+
+    P, R, T = precision_recall_curve(y_true, y_score)
+    f1s = (2 * P * R) / np.clip(P + R, 1e-12, None)
+    f1_idx = int(np.nanargmax(f1s)) if len(f1s) else 0
+    f1_max = float(f1s[f1_idx]) if len(f1s) else float("nan")
+    thr_f1_max = float(T[max(0, f1_idx - 1)]) if len(T) > 0 else 0.5
+
+    uniq = np.unique(y_score)
+    thr_candidates = np.r_[uniq[::-1], -np.inf]
+    best_thr, best_fpr, best_tpr = 1.0, 1.0, 0.0
+    for thr in thr_candidates:
+        y_pred = (y_score >= thr).astype(int)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+        tn = int(((y_pred == 0) & (y_true == 0)).sum())
+        fpr = fp / max(1, (fp + tn))
+        tpr = tp / max(1, (tp + fn))
+        if fpr <= fpr_budget:
+            best_thr, best_fpr, best_tpr = float(thr), float(fpr), float(tpr)
+            break
+    y_pred_op = (y_score >= best_thr).astype(int)
+    tp = int(((y_pred_op == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred_op == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred_op == 0) & (y_true == 1)).sum())
+    precision = tp / max(1, (tp + fp))
+    recall = tp / max(1, (tp + fn))
+    f1_at_op = (2 * precision * recall) / max(1e-12, precision + recall)
+
+    return {
+        "pr_auc": float(pr_auc),
+        "roc_auc": float(roc_auc),
+        "f1_max": float(f1_max),
+        "thr_f1_max": float(thr_f1_max),
+        "thr_op": float(best_thr),
+        "f1_at_op": float(f1_at_op),
+        "tpr_at_op": float(best_tpr),
+        "fpr_at_op": float(best_fpr),
+        "support_pos": int(y_true.sum()),
+        "support_neg": int((1 - y_true).sum()),
+    }
 
 
+# ---------- One epoch (robust batch unpack) ----------
+def _extract_xy(batch):
+    """Return (x, y) from a variety of batch shapes."""
+    if isinstance(batch, (list, tuple)):
+        if len(batch) < 2:
+            raise ValueError("Batch has fewer than 2 elements; expected at least (x, y).")
+        return batch[0], batch[1]
+    if isinstance(batch, dict):
+        # common dict keys
+        for kx, ky in (("image", "label"), ("x", "y"), ("inputs", "targets")):
+            if kx in batch and ky in batch:
+                return batch[kx], batch[ky]
+    raise ValueError(f"Unsupported batch type for unpacking (got {type(batch)}).")
 
-# ----------------- Core training -----------------
 
-def build_dataloaders(dataset, tr_idx, va_idx, cfg: TrainCfg):
-    tr_ds = Subset(dataset, tr_idx)
-    va_ds = Subset(dataset, va_idx)
+def one_epoch(model, loader, device, optimizer=None, grad_clip=1.0, desc: str = ""):
+    """
+    Runs one epoch over 'loader' with an optional optimizer (train if not None, else eval).
+    Shows a tqdm progress bar with batches completed.
+    """
+    is_train = optimizer is not None
+    model.train(is_train)
+    total_loss, n = 0.0, 0
+    all_logits, all_labels = [], []
 
-    dl_kwargs = dict(
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-        persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
-        prefetch_factor=max(2, cfg.prefetch_batches) if cfg.num_workers > 0 else None,
-    )
-    tr_loader = DataLoader(tr_ds, shuffle=True, **{k:v for k,v in dl_kwargs.items() if v is not None})
-    va_loader = DataLoader(va_ds, shuffle=False, **{k:v for k,v in dl_kwargs.items() if v is not None})
-    return tr_loader, va_loader
+    # nice, compact progress bar per epoch
+    pbar = tqdm(loader, desc=desc or ("train" if is_train else "val"),
+                unit="batch", dynamic_ncols=True, leave=False)
 
-def one_epoch(model, loader, device, criterion, optimizer, scaler, cfg: TrainCfg, train=True):
-    model.train(train)
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    for batch in pbar:
+        x, y = _extract_xy(batch)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
-    iterator = tqdm(loader, desc="Train" if train else "Val", leave=False)
-    for xb, yb, _ in iterator:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        if device.type == "cuda":
-            xb = xb.to(memory_format=torch.channels_last)
-
-        if train:
+        if is_train:
             optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = F.binary_cross_entropy_with_logits(logits, y.float())
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        else:
+            with torch.no_grad():
+                logits = model(x)
+                loss = F.binary_cross_entropy_with_logits(logits, y.float())
 
-        with (torch.amp.autocast(device_type="cuda") if (cfg.amp and device.type=="cuda") else contextlib.nullcontext()):
-            logits = model(xb)
-            loss = criterion(logits.view(-1), yb.float())
+        total_loss += float(loss.item()) * x.size(0)
+        n += x.size(0)
+        all_logits.extend(logits.detach().cpu().tolist())
+        all_labels.extend(y.detach().cpu().tolist())
 
-        if train:
-            if scaler:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                if cfg.grad_clip and cfg.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+        # optional per-batch postfix (kept light to avoid flicker)
+        if n > 0:
+            pbar.set_postfix(loss=f"{total_loss / n:.4f}")
+
+    avg = total_loss / max(1, n)
+    return avg, np.array(all_logits, np.float32), np.array(all_labels, np.int32)
+
+
+# ---------- Train run ----------
+def train_run(cfg: TrainArgs):
+    # Windows: avoid multi-proc DataLoader with dynamic imports
+    if platform.system().lower().startswith("win"):
+        if cfg.num_workers != 0 or cfg.persistent_workers:
+            print("[INFO] Windows detected: forcing num_workers=0 and persistent_workers=False to avoid pickling errors.")
+        cfg.num_workers = 0
+        cfg.persistent_workers = False
+
+    runs_root = Path(cfg.runs_root) / f"{cfg.mode}_seed{cfg.seed}"
+    export_root = Path(cfg.export_root)
+    ensure_dir(runs_root)
+    ensure_dir(export_root)
+
+    rows = read_filtered_rows(Path(cfg.data_csv), cfg.mode)
+    print(f"[PREFLIGHT] CSV summary: {cfg.data_csv}")
+    print(f"  total rows: {len(rows)}")
+    by_label = {'0': sum(1 for r in rows if r['label'] == 0),
+                '1': sum(1 for r in rows if r['label'] == 1)}
+    print(f"  by label  : {by_label}")
+
+    splits = build_grouped_stratified_folds(rows, cfg.kfold, cfg.seed) if cfg.kfold > 1 \
+        else build_holdout_split(rows, cfg.holdout, cfg.seed)
+    print(f"[INFO] Using {len(splits)} fold(s)")
+
+    dataset = ByteImageDataset(
+        csv_path=str(cfg.data_csv),
+        images_root=str(cfg.images_root),
+        normalize="01",
+        use_disk_cache=True,
+        cache_root="cache",
+        cache_max_bytes="40GB",
+        decode_cache_mem_mb=0,
+    )
+
+    device = torch.device("cuda" if (cfg.device == "cuda" or (cfg.device == "auto" and torch.cuda.is_available())) else "cpu")
+    print(f"[INFO] Using device: {device}")
+
+    best_overall = {"pr_auc": -1.0, "fold": -1, "ckpt_path": ""}
+
+    # Optional resume discovery for this (mode,seed) run
+    resume_state = None
+    runstate_path = runs_root / "runstate.json"
+    if cfg.resume and runstate_path.exists():
+        try:
+            rs = json.loads(runstate_path.read_text(encoding="utf-8"))
+            cur_fold = int(rs.get("current_fold", 1))
+            next_epoch = int(rs.get("next_epoch", 1))
+            intr_path = runs_root / f"fold{cur_fold}_interrupt.pt"
+            if intr_path.exists():
+                print(f"[RESUME] Found interrupt checkpoint: {intr_path} (fold={cur_fold}, next_epoch={next_epoch})")
+                state = torch.load(intr_path, map_location="cpu")
+                resume_state = {"fold": cur_fold, "next_epoch": next_epoch, "state": state}
             else:
-                loss.backward()
-                if cfg.grad_clip and cfg.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                optimizer.step()
+                print("[RESUME] runstate.json present but interrupt checkpoint not found; starting fresh.")
+        except Exception as e:
+            print(f"[RESUME] Failed to parse runstate.json: {e}; starting fresh.")
 
-        running_loss += loss.detach().item() * xb.size(0)
-        with torch.no_grad():
-            preds = (torch.sigmoid(logits.view(-1)) > 0.5).long()
-            correct += (preds == yb.long()).sum().item()
-            total += yb.numel()
+    for fi, (train_idx, val_idx) in enumerate(splits, start=1):
+        print(f"\n=== Fold {fi}/{len(splits)} ===")
+        print(f"[DEBUG] fold sizes -> train: {len(train_idx)} | val: {len(val_idx)}")
 
-    avg_loss = running_loss / max(1, total)
-    acc = correct / max(1, total)
-    return avg_loss, acc
+        # Skip completed folds when resuming
+        if resume_state and fi < resume_state['fold']:
+            print(f"[RESUME] Skipping fold {fi} (completed previously).")
+            continue
 
+        ds_train = Subset(dataset, train_idx)
+        ds_val   = Subset(dataset, val_idx)
 
-def _as_val_frac(holdout) -> float:
-    # 0–1 means fraction; 1–100 means percent
-    try:
-        x = float(holdout)
-    except Exception:
-        return 0.20
-    if x <= 0:
-        return 0.20
-    if x <= 1.0:
-        return max(0.05, min(0.95, x))
-    return max(0.05, min(0.95, x / 100.0))
+        train_labels = np.array([rows[i]['label'] for i in train_idx], dtype=int)
+        batch_sampler = StratifiedRatioBatchSampler(
+            train_labels, cfg.batch_size,
+            cfg.oversample_pos_min, cfg.oversample_pos_max,
+            cfg.seed + fi
+        )
 
-def compute_folds(N: int, groups: list[str], kfold: int, seed: int, holdout) -> list[tuple[list[int], list[int]]]:
-    """
-    Returns a list of (train_idx, val_idx) folds.
-    - kfold>=2: GroupKFold if available, else hash-based K buckets.
-    - kfold==1: group-aware shuffle split using 'holdout' as validation fraction.
-    """
-    folds: list[tuple[list[int], list[int]]] = []
+        train_loader = DataLoader(
+            ds_train,
+            batch_sampler=batch_sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_memory,
+            persistent_workers=cfg.persistent_workers,
+        )
+        val_loader = DataLoader(
+            ds_val,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+        )
 
-    if kfold and kfold >= 2:
-        # Preferred: sklearn GroupKFold
+        model = MalNetFocusAug(attention=True).to(device)
+        if device.type == "cuda":
+            model = model.to(memory_format=torch.channels_last)
+
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=cfg.weight_decay) \
+            if cfg.optimizer == "adamw" else optim.Adam(model.parameters(), lr=1e-3)
+
+        scheduler = None
+        if cfg.scheduler == "onecycle":
+            total_steps = max(1, cfg.epochs * len(train_loader))
+            max_lr = 1e-3 if str(cfg.max_lr) == "auto" else float(cfg.max_lr)
+            scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps)
+
+        # Safe-interrupt
+        interrupted = {"flag": False}
+
+        def _handle(sig, frame):
+            print("\n[INTERRUPT] Caught signal; saving safe checkpoint and exiting...")
+            interrupted["flag"] = True
+
+        old_handler = signal.signal(signal.SIGINT, _handle)
+
+        ckpt_dir = runs_root
+        ensure_dir(ckpt_dir)
+        fold_best = {"pr_auc": -1.0, "epoch": -1, "path": ""}
+
         try:
-            from sklearn.model_selection import GroupKFold
-            kf = GroupKFold(n_splits=kfold)
-            for tr_idx, va_idx in kf.split(list(range(N)), groups=groups):
-                folds.append((tr_idx.tolist(), va_idx.tolist()))
-            return folds
-        except Exception:
-            # Fallback: hash bucket by group
-            from collections import defaultdict
-            g2idx = defaultdict(list)
-            for i, g in enumerate(groups):
-                g2idx[g].append(i)
-            buckets = [[] for _ in range(kfold)]
-            for g, idxs in g2idx.items():
-                fid = (hash(g) + seed) % kfold
-                buckets[fid].extend(idxs)
-            for f in range(kfold):
-                va = buckets[f]
-                tr = [i for j in range(kfold) if j != f for i in buckets[j]]
-                folds.append((tr, va))
-            return folds
+            # Determine starting epoch if resuming this fold
+            start_epoch = 1
+            if resume_state and fi == resume_state['fold']:
+                start_epoch = max(1, int(resume_state['next_epoch']))
+                state = resume_state['state']
+                # best-effort state restore
+                try:
+                    model.load_state_dict(state.get('model', {}), strict=False)
+                except Exception:
+                    pass
+                if state.get('optimizer'):
+                    try:
+                        optimizer.load_state_dict(state['optimizer'])
+                    except Exception:
+                        pass
+                if scheduler and state.get('scheduler'):
+                    try:
+                        scheduler.load_state_dict(state['scheduler'])
+                    except Exception:
+                        pass
+                if start_epoch > cfg.epochs:
+                    print(f"[RESUME] Fold {fi} already completed in prior run (next_epoch={start_epoch} > epochs={cfg.epochs}); skipping.")
+                    continue
+                print(f"[RESUME] Continuing fold {fi} from epoch {start_epoch}")
 
-    # kfold == 1: group-aware shuffle split
-    val_frac = _as_val_frac(holdout)  # e.g., 0.2
-    rng = random.Random(seed)
-    # Preserve order of first occurrence, then shuffle groups
-    unique_groups = list(dict.fromkeys(groups))
-    rng.shuffle(unique_groups)
-    n_val_groups = max(1, int(round(len(unique_groups) * val_frac)))
-    val_set = set(unique_groups[:n_val_groups])
+            for epoch in range(start_epoch, cfg.epochs + 1):
+                tr_loss, _, _ = one_epoch(model, train_loader, device, optimizer=optimizer, grad_clip=cfg.grad_clip, desc=f"train f{fi} e{epoch}")
+                if scheduler is not None:
+                    scheduler.step()
 
-    va_idx = [i for i, g in enumerate(groups) if g in val_set]
-    tr_idx = [i for i, g in enumerate(groups) if g not in val_set]
+                val_loss, val_logits, val_labels = one_epoch(model, val_loader, device,optimizer=None, desc=f"val   f{fi} e{epoch}")
 
-    # Ensure both sides non-empty
-    if len(tr_idx) == 0:
-        # move one group from val to train
-        g0 = unique_groups[0]
-        val_set.discard(g0)
-        va_idx = [i for i, g in enumerate(groups) if g in val_set]
-        tr_idx = [i for i, g in enumerate(groups) if g not in val_set]
+                val_scores = sigmoid_np(val_logits)
+                metrics = compute_metrics(val_scores, val_labels, cfg.fpr_budget)
+                acc05 = float(((val_scores >= 0.5).astype(int) == val_labels).mean()) if len(val_labels) > 0 else float("nan")
 
-    folds.append((tr_idx, va_idx))
-    return folds
+                print(
+                    f"Epoch {epoch}/{cfg.epochs}: "
+                    f"train_loss={tr_loss:.4f} | val_loss={val_loss:.4f} acc@0.5={acc05:.3f} | "
+                    f"val: pr_auc={metrics['pr_auc']:.3f} roc_auc={metrics['roc_auc']:.3f} f1_max={metrics['f1_max']:.3f} | "
+                    f"op: thr={metrics['thr_op']:.3f} f1={metrics['f1_at_op']:.3f} tpr={metrics['tpr_at_op']:.3f} fpr={metrics['fpr_at_op']:.4f}"
+                )
 
+                if metrics["pr_auc"] > fold_best["pr_auc"]:
+                    fold_best.update({"pr_auc": metrics["pr_auc"], "epoch": epoch})
+                    ckpt_path = ckpt_dir / f"fold{fi}_best.pt"
+                    torch.save({
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler else None,
+                        "epoch": epoch,
+                        "metrics": metrics,
+                        "fpr_budget": cfg.fpr_budget,
+                        "seed": cfg.seed,
+                        "mode": cfg.mode,
+                        "fold": fi,
+                    }, ckpt_path)
+                    fold_best["path"] = str(ckpt_path)
+                    print(f"[CHECKPOINT] Saved fold {fi} best @ epoch {epoch} pr_auc={metrics['pr_auc']:.3f} -> {ckpt_path}")
 
-# ----------------- Main -----------------
+                if interrupted["flag"]:
+                    ckpt_path = ckpt_dir / f"fold{fi}_interrupt.pt"
+                    torch.save({
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler else None,
+                        "epoch": epoch,
+                        "seed": cfg.seed,
+                        "mode": cfg.mode,
+                        "fold": fi,
+                    }, ckpt_path)
+                    with (ckpt_dir / "runstate.json").open("w", encoding="utf-8") as f:
+                        json.dump({"current_fold": fi, "next_epoch": epoch, "interrupted_at": utc_now_iso()}, f, indent=2)
+                    print(f"[INTERRUPT] Checkpoint written: {ckpt_path}. Runstate saved.")
+                    print("[INTERRUPT] To resume: run the same command, or simply `python main.py train` to auto-resume latest.")
+                    return
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-csv", type=str, required=True)
-    ap.add_argument("--images-root", type=str, required=True)
-    ap.add_argument("--mode", type=str, choices=["compress","truncate"], default=None)
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--resume", action="store_true")
-    # Optional overrides
-    ap.add_argument("--epochs", type=int, default=None, help="Override training.epochs from config")
-    ap.add_argument("--kfold", type=int, default=None, help="Override training.kfold from config")
-    args = ap.parse_args()
+        print(f"[FOLD {fi}] best pr_auc={fold_best['pr_auc']:.3f} @ epoch {fold_best['epoch']}")
+        if fold_best["path"]:
+            print(f"[CHECKPOINT] Saved fold {fi} best state to: {fold_best['path']}")
 
-    # Config
-    cfg_yaml = load_yaml_cfg("config.yaml")
-    tsec = (cfg_yaml.get("training") or {})
-    tcfg = cfg_from_yaml(tsec)  # <-- no hardcoded defaults here
+        if fold_best["pr_auc"] > best_overall["pr_auc"]:
+            best_overall.update({"pr_auc": fold_best["pr_auc"], "fold": fi, "ckpt_path": fold_best["path"]})
 
-    print("\n[CONFIG] training section loaded from config.yaml:")
-    print(" ", tsec)
+    # ---------- Export best fold ----------
+    if not best_overall["ckpt_path"]:
+        print("[WARN] No best checkpoint found; skipping export.")
+        return
 
-    # Apply CLI overrides
-    if args.mode is not None:
-        tcfg.mode = args.mode
-    if args.epochs is not None:
-        tcfg.epochs = int(args.epochs)
-    if args.kfold is not None:
-        tcfg.kfold = int(args.kfold)
+    print(f"[SELECT] Best fold: {best_overall['fold']} pr_auc={best_overall['pr_auc']:.3f}")
+    state = torch.load(best_overall["ckpt_path"], map_location="cpu")
+    model = MalNetFocusAug(attention=True).eval()
+    model.load_state_dict(state["model"], strict=False)
 
-    # Seed: auto-increment per mode unless provided on CLI
-    seed = next_seed_for_mode(tcfg.mode, args.seed)
-    set_all_seeds(seed)
-
-    data_csv = Path(args.data_csv).resolve()
-    images_root = Path(args.images_root).resolve()
-
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device.type}")
-    if device.type == "cuda":
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-        except Exception:
-            pass
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
-
-    # Preflight CSV
-    if not data_csv.exists():
-        raise FileNotFoundError(f"Missing CSV: {data_csv}")
-    mode_ct, label_ct, total = csv_mode_counts(data_csv)
-    print(f"[PREFLIGHT] CSV summary: {data_csv}")
-    print(f"  total rows: {total}")
-    print(f"  by mode   : {mode_ct}")
-    print(f"  by label  : {label_ct}")
-
-    rows = read_csv_rows(data_csv)
-    rows_mode = filter_by_mode(rows, tcfg.mode)
-    if len(rows_mode) == 0:
-        raise RuntimeError(f"No rows for mode='{tcfg.mode}' found in {data_csv}. Did you convert that mode?")
-
-    tmp_csv = Path("tmp") / "conversion_log.filtered.csv"
-    ensure_dir(tmp_csv.parent)
-    write_csv_rows(tmp_csv, rows_mode)
-    print(f"[INFO] Filtered CSV by mode='{tcfg.mode}': kept {len(rows_mode)} rows -> {tmp_csv.as_posix()}")
-
-    # Dataset
-    dataset = ByteImageDataset(csv_path=str(tmp_csv), images_root=str(images_root))
-    N = len(dataset)
-    groups = group_hashes(rows_mode)
-    assert len(groups) == N, "Group list misaligned with filtered rows."
-
-    # Effective settings print
-    print("\n[CONFIG] Effective training settings")
-    print(f"  mode   : {tcfg.mode}")
-    print(f"  seed   : {seed}")
-    print(f"  epochs : {tcfg.epochs}")
-    print(f"  kfold  : {tcfg.kfold}")
-    print(f"  batch  : {tcfg.batch_size}")
-    print(f"  workers: {tcfg.num_workers} | prefetch: {tcfg.prefetch_batches} | "
-          f"pin_memory: {tcfg.pin_memory} | persistent_workers: {tcfg.persistent_workers}")
-    print(f"  torch_compile: {tcfg.torch_compile}")
-
-    # Group-aware K-Fold
-    folds: List[Tuple[List[int], List[int]]] = []
-    try:
-        from sklearn.model_selection import GroupKFold
-        kf = GroupKFold(n_splits=tcfg.kfold)
-        for tr_idx, va_idx in kf.split(list(range(N)), groups=groups):
-            folds.append((tr_idx.tolist(), va_idx.tolist()))
-    except Exception:
-        print("[WARN] sklearn not available; using hash-based group split.")
-        from collections import defaultdict
-        g2idx = defaultdict(list)
-        for i, g in enumerate(groups):
-            g2idx[g].append(i)
-        fold_buckets = [[] for _ in range(tcfg.kfold)]
-        for g, idxs in g2idx.items():
-            fid = (hash(g) + seed) % tcfg.kfold
-            fold_buckets[fid].extend(idxs)
-        for f in range(tcfg.kfold):
-            va = fold_buckets[f]
-            tr = [i for j in range(tcfg.kfold) if j != f for i in fold_buckets[j]]
-            folds.append((tr, va))
-
-    # Model, loss, opt, sched
-    model = MalNetFocusAug()  # attention is default True in your model.py
-    model.to(device)
-    if device.type == "cuda":
-        model.to(memory_format=torch.channels_last)
-    model = try_torch_compile(model, enable_flag=tcfg.torch_compile)
-
-    criterion = nn.BCEWithLogitsLoss()
-    max_lr = auto_lr(tcfg.max_lr, tcfg.batch_size)
-
-    def make_opt_sched(m: nn.Module, steps_per_epoch: int):
-        if tcfg.optimizer.lower() == "adamw":
-            opt = optim.AdamW(m.parameters(), lr=max_lr, weight_decay=tcfg.weight_decay)
-        else:
-            opt = optim.Adam(m.parameters(), lr=max_lr, weight_decay=tcfg.weight_decay)
-        if tcfg.scheduler.lower() == "onecycle":
-            sch = optim.lr_scheduler.OneCycleLR(
-                opt, max_lr=max_lr,
-                epochs=tcfg.epochs,
-                steps_per_epoch=max(1, steps_per_epoch),
-                pct_start=0.1, anneal_strategy="cos"
-            )
-        else:
-            sch = None
-        return opt, sch
-
-    use_amp = (tcfg.amp and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-
-    run_dir = Path("runs") / f"{tcfg.mode}_seed{seed}"
-    ensure_dir(run_dir)
-
-    # Train across folds
-    # --- folds ---
-    folds = compute_folds(N, groups, tcfg.kfold, seed, tcfg.holdout)
-    for fidx, (tr_idx, va_idx) in enumerate(folds, start=1):
-        print(f"\n=== Fold {fidx}/{tcfg.kfold} ===")
-        print(f"[DEBUG] fold sizes -> train: {len(tr_idx)} | val: {len(va_idx)}")
-        tr_loader, va_loader = build_dataloaders(dataset, tr_idx, va_idx, tcfg)
-        steps_per_epoch = math.ceil(len(tr_idx) / max(1, tcfg.batch_size))
-        optimizer, scheduler = make_opt_sched(model, steps_per_epoch)
-
-        for epoch in range(tcfg.epochs):
-            tr_loss, tr_acc = one_epoch(model, tr_loader, device, criterion, optimizer, scaler, tcfg, train=True)
-            if scheduler is not None:
-                scheduler.step()
-            model.eval()
-            with torch.inference_mode():
-                va_loss, va_acc = one_epoch(model, va_loader, device, criterion, optimizer, scaler, tcfg, train=False)
-            print(f"Epoch {epoch+1}/{tcfg.epochs}: "
-                  f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} | "
-                  f"val_loss={va_loss:.4f} val_acc={va_acc:.3f}")
-
-        # save light checkpoint per fold
-        fold_file = run_dir / f"fold{fidx}_last.pt"
-        torch.save({"model": model.state_dict(),
-                    "cfg": tcfg.__dict__,
-                    "seed": seed,
-                    "fold": fidx}, fold_file)
-        print(f"[CHECKPOINT] Saved fold {fidx} end state to: {run_dir}")
-
-    # Export TorchScript with per-mode iteration
-    export_dir = Path("export_models")
+    export_dir = Path(cfg.export_root)
     ensure_dir(export_dir)
-    iter_id = next_export_iter_for_mode(tcfg.mode)
-    out_path = export_dir / f"cnn_{tcfg.mode}_{seed}_{iter_id}.ts.pt"
-    model.eval()
-    example = torch.randn(1, 1, 256, 256, device=device)
+    existing = sorted(export_dir.glob(f"cnn_{cfg.mode}_{cfg.seed}_*.ts.pt"))
+    iter_id = 1
+    if existing:
+        try:
+            iter_id = max(int(p.stem.split("_")[-1]) for p in existing) + 1
+        except Exception:
+            iter_id = len(existing) + 1
+    out_path = export_dir / f"cnn_{cfg.mode}_{cfg.seed}_{iter_id}.ts.pt"
+
+    example = torch.randn(1, 1, 256, 256)
     with torch.inference_mode():
         scripted = torch.jit.trace(model, example)
     scripted.save(str(out_path))
+
     print(f"[EXPORT] Saved TorchScript model: {out_path.as_posix()}")
     print(f"[EXPORT] Load with: model = torch.jit.load('{out_path.as_posix()}')")
+
+    meta = {
+        "mode": cfg.mode,
+        "seed": cfg.seed,
+        "fold": int(best_overall["fold"]),
+        "metrics": state.get("metrics", {}),
+        "fpr_budget": cfg.fpr_budget,
+        "exported_at": utc_now_iso(),
+        "export_path": out_path.as_posix(),
+    }
+    meta_path = out_path.with_suffix(".meta.json")
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[EXPORT] Saved meta: {meta_path.as_posix()}")
+
+
+# ---------- Main ----------
+def main():
+    args_min, raw_cli = parse_cli()
+    args = apply_config_and_cli_defaults(args_min, raw_cli)
+    print("[CONFIG] Effective training settings")
+    print("  " + "\n  ".join(f"{k}: {v}" for k, v in asdict(args).items()))
+    train_run(args)
 
 
 if __name__ == "__main__":
