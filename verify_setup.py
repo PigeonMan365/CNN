@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-verify_setup.py — richer environment & data diagnostics + speed-oriented recommendations
-Now also considers SSD/disk space for images_root and cache_root in its guidance.
+verify_setup.py — environment & data diagnostics + auto-bootstrap
 
-It prints:
-- Python, PyTorch, CUDA, GPU name/VRAM, CPU cores, System RAM
+What it prints:
+- Python, PyTorch, CUDA, GPU, CPU cores, RAM
 - Requirements check (imports) from requirements.txt
 - Paths (from config.yaml or defaults)
-- Disk usage (total/free) for images_root and cache_root + same-device check
+- Disk usage for images_root and cache_root + same-device note
 - Dataset summary (from logs/conversion_log.csv)
-- Speed recommendations (batch size, workers, prefetch, pin_memory, persistent_workers, AMP)
-- Cache recommendations based on *free disk* at cache_root (paths.cache_max_bytes & use_disk_cache)
+- Speed recommendations (batch size, workers, prefetch, pin_memory, AMP)
+- Cache recommendations based on free disk at cache_root
+
+What it CREATES if missing (non-destructive):
+- dataset/output/{compress,truncate}/{benign,malware}
+- logs/, cache/
+- logs/conversion_log.csv rebuilt by scanning dataset/output/*
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import os
 import sys
 import csv
 import json
+import hashlib
 import shutil
 import importlib
 from pathlib import Path
@@ -41,6 +46,9 @@ def load_yaml(path="config.yaml") -> dict:
 
 def bytes_to_gb(n: int) -> float:
     return round(n / (1024**3), 2)
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 def get_ram_info():
     # psutil is preferred; fallbacks provided
@@ -188,6 +196,86 @@ def same_device(a: Path, b: Path) -> bool | None:
             pass
         return None
 
+# --------- bootstrap helpers (non-destructive) ---------
+
+def _hash_file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def rebuild_conversion_log_from_dataset(images_root: Path, log_csv: Path) -> int:
+    """
+    Walk dataset/output and rebuild logs/conversion_log.csv with:
+      rel_path,label,mode,sha256
+    mode   = {compress, truncate} (top-level folder under images_root)
+    label  = 1 if 'malware' folder, 0 if 'benign'
+    rel_path = POSIX path relative to images_root (e.g., 'compress/malware/foo.png')
+    sha256 = SHA-256 of the file contents
+    Returns number of rows written (excluding header).
+    """
+    ensure_dir(log_csv.parent)
+    ensure_dir(images_root)
+
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
+    rows = []
+
+    for mode in ("compress", "truncate"):
+        for cls, label in (("benign", 0), ("malware", 1)):
+            base = images_root / mode / cls
+            if not base.exists():
+                continue
+            for p in base.rglob("*"):
+                if p.is_file() and p.suffix.lower() in exts:
+                    rel_path = p.relative_to(images_root).as_posix()
+                    sha256 = _hash_file_sha256(p)
+                    rows.append((rel_path, label, mode, sha256))
+
+    # always (re)write header + rows
+    with log_csv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rel_path", "label", "mode", "sha256"])
+        for rel_path, label, mode, sha256 in rows:
+            w.writerow([rel_path, label, mode, sha256])
+
+    print(f"[verify] rebuilt {log_csv} from {images_root} with {len(rows)} rows")
+    return len(rows)
+
+def ensure_project_skeleton(cfg: dict) -> tuple[Path, Path, Path]:
+    """
+    Ensure minimal non-destructive skeleton:
+      dataset/output/{compress,truncate}/{benign,malware}
+      logs/
+      cache/
+    Returns (images_root, data_csv, cache_root).
+    """
+    paths = cfg.get("paths", {})
+    ti    = cfg.get("train_io", {})
+
+    data_csv    = Path(ti.get("data_csv", paths.get("conversion_log", "logs/conversion_log.csv")))
+    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output"))).resolve()
+    cache_root  = Path(paths.get("cache_root", "cache")).resolve()
+
+    # Create required dirs if missing (preserve existing)
+    for mode in ("compress", "truncate"):
+        for cls in ("benign", "malware"):
+            ensure_dir(images_root / mode / cls)
+
+    ensure_dir(cache_root)
+    ensure_dir(data_csv.parent)
+    ensure_dir(Path("runs"))
+    ensure_dir(Path("tmp"))
+    ensure_dir(Path(cfg.get("training", {}).get("export_root", "export_models")))
+
+    # (Re)build conversion log from dataset/output
+    rebuild_conversion_log_from_dataset(images_root, data_csv)
+
+    return images_root, data_csv, cache_root
+
 # -------------- main --------------
 
 def main():
@@ -222,13 +310,11 @@ def main():
         print(f"CPU    : cores={cores}")
         print("RAM    : unknown (install psutil for detailed RAM)")
 
-    # Paths from config
+    # Load config
     cfg = load_yaml("config.yaml") or {}
-    paths = cfg.get("paths", {})
-    ti    = cfg.get("train_io", {})
-    data_csv    = Path(ti.get("data_csv", paths.get("conversion_log", "logs/conversion_log.csv")))
-    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output"))).resolve()
-    cache_root  = Path(paths.get("cache_root", "cache")).resolve()
+
+    # ---------------- AUTO-BOOTSTRAP: create folders + rebuild CSV ----------------
+    images_root, data_csv, cache_root = ensure_project_skeleton(cfg)
 
     print("\n--- Paths (from config or defaults) ---")
     print(f"data_csv    : {data_csv}")
@@ -257,7 +343,7 @@ def main():
     else:
         print("NOTE       : Could not determine if images_root and cache_root share the same device.")
 
-    # Dataset summary
+    # Dataset summary (after rebuild)
     print("\n--- Dataset summary (from conversion_log.csv) ---")
     total, by_mode, by_label = summarize_csv(data_csv)
     print(f"Total rows: {total}")
@@ -295,7 +381,7 @@ def main():
         else:
             bs = 128
     else:
-        bs = 12 if ram and ram["available"] > 8*(1024**3) else 8
+        bs = 12 if ram and ram["available"] and ram["available"] > 8*(1024**3) else 8
 
     # Workers/prefetch tuned by CPU cores and RAM
     if isinstance(cores, int):
@@ -303,7 +389,7 @@ def main():
     else:
         nw = 4
 
-    if ram and ram["available"] >= 8*(1024**3):
+    if ram and ram.get("available", 0) >= 8*(1024**3):
         prefetch = 4
         decode_mb = 1024
     else:
@@ -318,20 +404,17 @@ def main():
     cache_cap_str = "40GB"
     use_disk_cache = True
     if cac_exists and cac_free is not None:
-        # If free space is tiny, recommend disabling disk cache to avoid churn
         if cac_free < 8*(1024**3):  # < 8 GB free
             use_disk_cache = False
             cache_cap_str = "0GB"
         else:
-            # use ~30% of free space, minimum 10 GB, capped at total
+            # use ~30% of free space, minimum 10 GB, capped at total-4GB headroom
             suggest_bytes = int(cac_free * 0.30)
             suggest_gb = max(10, suggest_bytes // (1024**3))
-            # never exceed total
             if cac_total:
-                suggest_gb = min(suggest_gb, max(1, int(cac_total // (1024**3)) - 4))  # keep 4GB headroom
+                suggest_gb = min(suggest_gb, max(1, int(cac_total // (1024**3)) - 4))
             cache_cap_str = f"{suggest_gb}GB"
     else:
-        # Unknown volume; conservative default
         use_disk_cache = True
         cache_cap_str = "40GB"
 
@@ -361,3 +444,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
