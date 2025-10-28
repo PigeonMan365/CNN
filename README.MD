@@ -69,8 +69,7 @@ export_models/cnn_<mode>_<seed>_<iter>.ts.pt
 
 ### 1.6 — Multi-run orchestration (resumable)
 ```bash
-python main.py orchestrate --runs 3
-python main.py orchestrate status
+python main.py orchestrate plan --runs 3
 python main.py orchestrate resume
 ```
 
