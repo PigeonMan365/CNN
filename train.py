@@ -121,48 +121,76 @@ class TrainArgs:
 
 
 def parse_cli() -> TrainArgs:
+    """
+    Simplified CLI - only essential arguments.
+    Everything else comes from config.yaml.
+    """
     p = argparse.ArgumentParser(description="Train MalNet-FocusAug")
-    p.add_argument("--data-csv", required=True)
-    p.add_argument("--images-root", required=True)
-    p.add_argument("--mode", required=True, choices=["compress", "truncate"])
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--num-workers", type=int, default=None)
-    p.add_argument("--prefetch-batches", type=int, default=None)
-    p.add_argument("--pin-memory", action="store_true")
-    p.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
-    p.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
-    p.add_argument("--kfold", type=int, default=None)
-    p.add_argument("--holdout", type=int, default=None)
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--fpr-budget", type=float, default=None)
-    p.add_argument("--oversample-pos-range", type=str, default=None)
-    p.add_argument("--optimizer", default=None, choices=["adam", "adamw"])
-    p.add_argument("--scheduler", default=None, choices=["none", "onecycle"])
-    p.add_argument("--max-lr", default=None)
-    p.add_argument("--grad-clip", type=float, default=None)
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--runs-root", default=None)
-    p.add_argument("--export-root", default=None)
+    p.add_argument("--data-csv", help="Override data CSV path (default: from config)")
+    p.add_argument("--images-root", help="Override images root (default: from config)")
+    p.add_argument("--mode", choices=["resize", "truncate"], 
+                   help="Override training mode (default: from config.training.mode)")
+    p.add_argument("--seed", type=int, help="Override seed (default: auto-increment or from config)")
+    p.add_argument("--resume", action="store_true", 
+                   help="Resume training from checkpoint")
     a = p.parse_args()
 
+    # Create minimal args - will be filled from config
     args = TrainArgs(
-        data_csv=a.data_csv,
-        images_root=a.images_root,
-        mode=a.mode,
+        data_csv=a.data_csv or "",  # Will be set from config if not provided
+        images_root=a.images_root or "",  # Will be set from config if not provided
+        mode=a.mode or "",  # Will be set from config if not provided
     )
     return args, a
 
 
 def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
     cfg = _load_config_dict()
+    
+    # Helper to parse target size from string or config
+    def _parse_target_size(value, default: tuple[int, int]) -> tuple[int, int]:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip()
+            if "," in value:
+                parts = value.split(",")
+            elif "x" in value.lower():
+                parts = value.lower().split("x")
+            else:
+                try:
+                    val = int(value)
+                    return (val, val)
+                except ValueError:
+                    return default
+            if len(parts) >= 2:
+                return (int(parts[0].strip()), int(parts[1].strip()))
+            elif len(parts) == 1:
+                val = int(parts[0].strip())
+                return (val, val)
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2:
+                return (int(value[0]), int(value[1]))
+            elif len(value) == 1:
+                val = int(value[0])
+                return (val, val)
+        return default
 
-    # paths
-    data_csv = _get(cfg, "train_io.data_csv", args.data_csv) or args.data_csv
-    images_root = _get(cfg, "train_io.images_root", args.images_root) or args.images_root
-    runs_root = _get(cfg, "train_io.runs_root", args.runs_root) or args.runs_root
-    export_root = _get(cfg, "training.export_root", args.export_root) or args.export_root
+    # paths - read from config if not provided via CLI
+    data_csv = raw_cli.data_csv if raw_cli.data_csv else _get(cfg, "train_io.data_csv", "logs/conversion_log.csv")
+    images_root = raw_cli.images_root if raw_cli.images_root else _get(cfg, "train_io.images_root", "dataset/output")
+    runs_root = _get(cfg, "train_io.runs_root", "runs")
+    export_root = _get(cfg, "training.export_root", "export_models")
+    
+    # mode - read from config if not provided via CLI
+    mode = raw_cli.mode if raw_cli.mode else _get(cfg, "training.mode", "resize")
+    if mode not in ("resize", "truncate"):
+        raise ValueError(f"Invalid mode '{mode}'. Must be 'resize' or 'truncate' (not 'both' - that's handled by main.py)")
+    
+    # Parse target sizes from config (no CLI override - use config only)
+    training_cfg = cfg.get("training", {})
+    resize_size = _parse_target_size(training_cfg.get("resize_target_size"), (64, 64))
+    truncate_size = _parse_target_size(training_cfg.get("truncate_target_size"), (256, 256))
 
     # training defaults
     epochs = _get(cfg, "training.epochs", _get(cfg, "training.epoch", args.epochs))
@@ -194,34 +222,38 @@ def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
     except Exception:
         oversample_pos_min, oversample_pos_max = args.oversample_pos_min, args.oversample_pos_max
 
-    # helper choose
+    # helper choose - CLI only for seed and resume, everything else from config
     def choose(val_cfg, val_cli, val_def):
         return val_cli if (val_cli is not None and val_cli != "") else (val_cfg if val_cfg is not None else val_def)
 
+    # Seed handling - CLI override or auto-increment (handled elsewhere)
+    seed = raw_cli.seed if raw_cli.seed is not None else _get(cfg, "training.seed", args.seed)
+
     args = replace(
         args,
-        data_csv=choose(data_csv, raw_cli.data_csv, args.data_csv),
-        images_root=choose(images_root, raw_cli.images_root, args.images_root),
-        seed=choose(_get(cfg, "training.seed", args.seed), raw_cli.seed, args.seed),
-        epochs=choose(epochs, raw_cli.epochs, args.epochs),
-        batch_size=choose(batch_size, raw_cli.batch_size, args.batch_size),
-        num_workers=choose(num_workers, raw_cli.num_workers, args.num_workers),
-        prefetch_batches=choose(prefetch_batches, raw_cli.prefetch_batches, args.prefetch_batches),
-        pin_memory=True if raw_cli.pin_memory else pin_memory,
-        persistent_workers=choose(persistent_workers, raw_cli.persistent_workers, args.persistent_workers),
-        device=choose(device, raw_cli.device, args.device),
-        kfold=choose(kfold, raw_cli.kfold, args.kfold),
-        holdout=choose(holdout, raw_cli.holdout, args.holdout),
-        resume=True if raw_cli.resume else args.resume,
-        fpr_budget=choose(fpr_budget, raw_cli.fpr_budget, args.fpr_budget),
-        optimizer=choose(optimizer, raw_cli.optimizer, args.optimizer),
-        scheduler=choose(scheduler, raw_cli.scheduler, args.scheduler),
-        max_lr=choose(max_lr, raw_cli.max_lr, args.max_lr),
-        weight_decay=choose(weight_decay, None, args.weight_decay),
-        grad_clip=choose(grad_clip, raw_cli.grad_clip, args.grad_clip),
-        amp=True if raw_cli.amp else amp,
-        runs_root=choose(runs_root, raw_cli.runs_root, args.runs_root),
-        export_root=choose(export_root, raw_cli.export_root, args.export_root),
+        data_csv=data_csv,
+        images_root=images_root,
+        mode=mode,
+        seed=seed if seed is not None else args.seed,
+        epochs=epochs if epochs is not None else args.epochs,
+        batch_size=batch_size if batch_size is not None else args.batch_size,
+        num_workers=num_workers if num_workers is not None else args.num_workers,
+        prefetch_batches=prefetch_batches if prefetch_batches is not None else args.prefetch_batches,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        device=device,
+        kfold=kfold if kfold is not None else args.kfold,
+        holdout=holdout if holdout is not None else args.holdout,
+        resume=raw_cli.resume if hasattr(raw_cli, 'resume') else args.resume,
+        fpr_budget=fpr_budget if fpr_budget is not None else args.fpr_budget,
+        optimizer=optimizer if optimizer is not None else args.optimizer,
+        scheduler=scheduler if scheduler is not None else args.scheduler,
+        max_lr=max_lr if max_lr is not None else args.max_lr,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        amp=amp,
+        runs_root=runs_root,
+        export_root=export_root,
         oversample_pos_min=oversample_pos_min,
         oversample_pos_max=oversample_pos_max,
     )
@@ -418,6 +450,49 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -
     }
 
 
+# ---------- Custom collate function for variable-size images ----------
+def collate_variable_size(batch):
+    """
+    Custom collate function that handles variable-size images by padding to the maximum size.
+    This is useful if images have different sizes (though preprocessing should produce fixed sizes).
+    
+    Args:
+        batch: List of (x, y, rel_path) tuples from dataset
+    
+    Returns:
+        (x_padded, y, rel_paths) where x_padded is batched and padded to max size
+    """
+    # Unpack batch
+    images, labels, rel_paths = zip(*batch)
+    
+    # Convert to tensors if needed
+    images = [x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in images]
+    labels = [y if isinstance(y, torch.Tensor) else torch.tensor(y, dtype=torch.long) for y in labels]
+    
+    # Find max height and width
+    max_h = max(img.shape[-2] for img in images)
+    max_w = max(img.shape[-1] for img in images)
+    
+    # Pad all images to max size (pad right and bottom with zeros)
+    padded_images = []
+    for img in images:
+        # img shape: (C, H, W) or (1, H, W)
+        c, h, w = img.shape
+        pad_h = max_h - h
+        pad_w = max_w - w
+        if pad_h > 0 or pad_w > 0:
+            # Pad: (left, right, top, bottom) for last 2 dims
+            padded = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0.0)
+        else:
+            padded = img
+        padded_images.append(padded)
+    
+    # Stack into batch
+    x_batch = torch.stack(padded_images, dim=0)  # (B, C, H, W)
+    y_batch = torch.stack(labels, dim=0)  # (B,)
+    
+    return x_batch, y_batch, list(rel_paths)
+
 # ---------- One epoch (robust batch unpack) ----------
 def _extract_xy(batch):
     """Return (x, y) from a variety of batch shapes."""
@@ -448,6 +523,7 @@ def one_epoch(model, loader, device, optimizer=None, grad_clip=1.0, desc: str = 
                 unit="batch", dynamic_ncols=True, leave=False)
 
     for batch in pbar:
+        # Custom collate returns (x, y, rel_paths), _extract_xy handles it
         x, y = _extract_xy(batch)
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -502,6 +578,16 @@ def train_run(cfg: TrainArgs):
     splits = build_grouped_stratified_folds(rows, cfg.kfold, cfg.seed) if cfg.kfold > 1 \
         else build_holdout_split(rows, cfg.holdout, cfg.seed)
     print(f"[INFO] Using {len(splits)} fold(s)")
+
+    # Get target sizes from config (already parsed in apply_config_and_cli_defaults)
+    # Note: These are used during conversion; dataset loads whatever PNGs exist
+    cfg_dict = _load_config_dict()
+    training_cfg = cfg_dict.get("training", {})
+    from preprocessing.convert import _parse_target_size
+    resize_size = _parse_target_size(training_cfg.get("resize_target_size"), (64, 64))
+    truncate_size = _parse_target_size(training_cfg.get("truncate_target_size"), (256, 256))
+    expected_size = resize_size if cfg.mode == "resize" else truncate_size
+    print(f"[INFO] Mode: {cfg.mode}, expected image size: {expected_size[0]}x{expected_size[1]}")
 
     dataset = ByteImageDataset(
         csv_path=str(cfg.data_csv),
@@ -561,6 +647,7 @@ def train_run(cfg: TrainArgs):
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             persistent_workers=cfg.persistent_workers,
+            collate_fn=collate_variable_size,  # Handle variable sizes gracefully
         )
         val_loader = DataLoader(
             ds_val,
@@ -569,6 +656,7 @@ def train_run(cfg: TrainArgs):
             num_workers=0,
             pin_memory=False,
             persistent_workers=False,
+            collate_fn=collate_variable_size,  # Handle variable sizes gracefully
         )
 
         model = MalNetFocusAug(attention=True).to(device)

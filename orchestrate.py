@@ -4,8 +4,8 @@
 orchestrate.py — seed-round planner/executor
 
 Plan format:
-  Round s:  compress@s → truncate@s
-  Round s+1: compress@s+1 → truncate@s+1
+  Round s:  resize@s → truncate@s
+  Round s+1: resize@s+1 → truncate@s+1
 The plan preserves per-round ordering and only increments the seed after both
 modes for a round complete.
 
@@ -142,7 +142,7 @@ def cmd_plan(args):
     jobs: List[Job] = []
     for i in range(rounds):
         s = start_seed + i
-        jobs.append(Job("compress", s))
+        jobs.append(Job("resize", s))
         jobs.append(Job("truncate", s))
 
     plans = _load_all_plans()
@@ -151,7 +151,7 @@ def cmd_plan(args):
     plans.append(plan)
     _save_all_plans(plans)
     print(f"[ORCH] Created plan {pid} with total jobs = {len(jobs)} "
-          f"(grouped into {rounds} round(s) of compress->truncate by seed).")
+          f"(grouped into {rounds} round(s) of resize->truncate by seed).")
     print(f"[ORCH] Log: {PLANS_JSON}")
 
 

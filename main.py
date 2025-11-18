@@ -13,7 +13,7 @@ subcommands:
 
 notes:
 - seeds are tracked in runs/seed_state.json
-- "train --mode both" trains compress and truncate with the SAME seed, then advances it
+- "train --mode both" trains resize and truncate with the SAME seed, then advances it
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ class ResumeInfo:
     fold: int
     ckpt: Path
 
-INTERRUPT_RE = re.compile(r"^(?P<mode>compress|truncate)_seed(?P<seed>\d+)$")
+INTERRUPT_RE = re.compile(r"^(?P<mode>resize|truncate)_seed(?P<seed>\d+)$")
 
 def _find_most_recent_interrupt(runs_root: Path = HERE / "runs") -> Optional[ResumeInfo]:
     """
@@ -155,9 +155,9 @@ def _rebuild_conversion_log_from_dataset(images_root: Path, log_csv: Path) -> in
     ensure_dir(images_root)
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
     rows: List[str] = []
-    for mode in ("compress", "truncate"):
-        for cls, label in (("benign", 0), ("malware", 1)):
-            base = images_root / mode / cls
+    for cls, label in (("benign", 0), ("malware", 1)):
+        for mode in ("resize", "truncate"):
+            base = images_root / cls / mode
             if not base.exists():
                 continue
             for p in base.rglob("*"):
@@ -201,17 +201,32 @@ def cmd_convert(args):
     ensure_dir(Path("logs"))
     ensure_dir(images_root)
 
+    # Parse target sizes from CLI if provided
+    from preprocessing.convert import _parse_target_size
+    resize_size = None
+    truncate_size = None
+    if getattr(args, "resize_size", None):
+        resize_size = _parse_target_size(args.resize_size, (64, 64))
+    if getattr(args, "truncate_size", None):
+        truncate_size = _parse_target_size(args.truncate_size, (256, 256))
+    
     used_fallback = False
     try:
         from preprocessing.convert import run_all as _run_all
         print("[convert] using preprocessing.convert.run_all")
         _run_all(config_path=getattr(args, "config", "config.yaml"),
-                 rebuild_only=False, skip_convert=False)
+                 rebuild_only=False, skip_convert=False,
+                 resize_target_size=resize_size,
+                 truncate_target_size=truncate_size)
     except Exception as e:
         used_fallback = True
         print(f"[convert] import failed: {e.__class__.__name__}: {e}")
         print("[convert] falling back to subprocess: python -m preprocessing.convert")
         cmd = [sys.executable, "-m", "preprocessing.convert", "--config", getattr(args, "config", "config.yaml")]
+        if resize_size:
+            cmd.extend(["--resize-size", f"{resize_size[0]},{resize_size[1]}"])
+        if truncate_size:
+            cmd.extend(["--truncate-size", f"{truncate_size[0]},{truncate_size[1]}"])
         print("> " + " ".join(cmd))
         subprocess.run(cmd, check=False)
 
@@ -225,13 +240,13 @@ def cmd_convert(args):
                 continue
             parts = rel.split("/")
             if len(parts) >= 3:
-                k = (parts[0], parts[1])  # (mode, label)
+                k = (parts[0], parts[1])  # (label, mode)
                 counts[k] = counts.get(k, 0) + 1
 
     if counts:
         print("[convert] PNG counts under images_root:")
-        for (mode, label), n in sorted(counts.items()):
-            print(f"  {mode:9s} / {label:7s} : {n}")
+        for (label, mode), n in sorted(counts.items()):
+            print(f"  {label:7s} / {mode:9s} : {n}")
     else:
         print("[convert] No PNGs found under images_root.")
 
@@ -249,20 +264,19 @@ def cmd_convert(args):
 # ----------------- subcommand: train -----------------
 
 def _build_train_cmd(mode: str, seed: int, cfg: dict, resume: bool) -> list:
-    paths = cfg.get("paths", {})
-    ti    = cfg.get("train_io", {})
-    data_csv    = Path(ti.get("data_csv", paths.get("conversion_log", "logs/conversion_log.csv")))
-    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output")))
+    """
+    Build command to run train.py.
+    Most settings come from config.yaml, only pass essential overrides.
+    """
     py = sys.executable
     train_py = HERE / "train.py"
     cmd = [
         py, str(train_py),
-        "--data-csv", str(data_csv),
-        "--images-root", str(images_root),
         "--mode", mode,
         "--seed", str(seed),
     ]
-    # Let train.py pick the rest from config; only pass resume if requested
+    # data-csv and images-root will be read from config if not provided
+    # Only pass resume if requested
     if resume:
         cmd.append("--resume")
     return cmd
@@ -273,10 +287,10 @@ def cmd_train(args):
     - If no --resume:
         * if an interrupt exists, resume it automatically
         * else start a new run based on config.yaml defaults
-    - If --mode both, train compress then truncate with SAME seed; bump seed once after both succeed.
+    - If --mode both, train resize then truncate with SAME seed; bump seed once after both succeed.
     """
     cfg = load_cfg(getattr(args, "config", None))
-    default_mode = cfg_get(cfg, "training.default_mode", "both")
+    default_mode = cfg_get(cfg, "training.mode", "resize")
     allow_resume = bool(cfg_get(cfg, "training.allow_resume", True))
 
     # Discover most recent interrupt if any
@@ -287,8 +301,8 @@ def cmd_train(args):
     if mode is None:
         mode = default_mode
     mode = mode.lower()
-    if mode not in ("compress", "truncate", "both"):
-        print(f"[train] invalid mode '{mode}'. use compress|truncate|both")
+    if mode not in ("resize", "truncate", "both"):
+        print(f"[train] invalid mode '{mode}'. use resize|truncate|both")
         sys.exit(2)
 
     # Determine seed
@@ -313,8 +327,8 @@ def cmd_train(args):
     # Otherwise: new run (single mode or both)
     if mode == "both":
         seed_to_use = seed
-        # compress
-        cmd = _build_train_cmd("compress", seed_to_use, cfg, resume=False)
+        # resize
+        cmd = _build_train_cmd("resize", seed_to_use, cfg, resume=False)
         print("> " + " ".join(cmd))
         rc1 = subprocess.run(cmd, check=False).returncode
         # truncate
@@ -369,9 +383,9 @@ def cmd_reset(_args):
         _wipe(d)
 
     # Ensure dataset skeleton exists, but DO NOT delete contents
-    for mode in ("compress", "truncate"):
-        for cls in ("benign", "malware"):
-            ensure_dir(images_root / mode / cls)
+    for cls in ("benign", "malware"):
+        for mode in ("resize", "truncate"):
+            ensure_dir(images_root / cls / mode)
 
     # Reset seed ledger
     if SEED_LEDGER.exists():
@@ -406,6 +420,32 @@ def cmd_orch_resume(_args):
     print("> " + " ".join(cmd))
     subprocess.run(cmd, check=False)
 
+# ----------------- subcommand: test -----------------
+
+def cmd_test(args):
+    """Handle test subcommands."""
+    test_cmd = getattr(args, "test_cmd", None)
+    if test_cmd == "convert":
+        py = sys.executable
+        test_script = HERE / "preprocessing" / "test_convert.py"
+        if not test_script.exists():
+            print("[test] preprocessing/test_convert.py not found.")
+            sys.exit(2)
+        cmd = [py, str(test_script)]
+        if hasattr(args, "num_files") and args.num_files and args.num_files != 5:
+            cmd.extend(["--num-files", str(args.num_files)])
+        if hasattr(args, "no_cleanup") and args.no_cleanup:
+            cmd.append("--no-cleanup")
+        if hasattr(args, "config") and args.config:
+            cmd.extend(["--config", str(args.config)])
+        print("> " + " ".join(cmd))
+        rc = subprocess.run(cmd, check=False).returncode
+        sys.exit(rc)
+    else:
+        print(f"[test] Unknown test command: {test_cmd}")
+        print("[test] Available: convert")
+        sys.exit(2)
+
 # ----------------- CLI -----------------
 
 def build_parser():
@@ -418,11 +458,16 @@ def build_parser():
     sp_verify.set_defaults(func=cmd_verify)
 
     sp_convert = sp.add_parser("convert", help="Convert binaries -> images (both modes) and rebuild CSV.")
+    sp_convert.add_argument("--resize-size", type=str, default=None,
+                           help="Override resize target size (e.g., '64,64' or '64x64')")
+    sp_convert.add_argument("--truncate-size", type=str, default=None,
+                           help="Override truncate target size (e.g., '256,256' or '256x256')")
     sp_convert.set_defaults(func=cmd_convert)
 
     sp_train = sp.add_parser("train", help="Train a model; auto-resume if an interrupt exists; else start new.")
-    sp_train.add_argument("--mode", choices=["compress", "truncate", "both"], help="Training mode (default from config.training.default_mode or 'both').")
-    sp_train.add_argument("--seed", type=int, help="Seed to use (default: from seed ledger or config.training.base_seed).")
+    sp_train.add_argument("--mode", choices=["resize", "truncate", "both"], 
+                         help="Override training mode from config (default: from config.training.mode).")
+    sp_train.add_argument("--seed", type=int, help="Override seed (default: from seed ledger or auto-increment).")
     sp_train.add_argument("--resume", action="store_true", help="Resume this run (or the most recent interrupted run if --mode/--seed omitted).")
     sp_train.set_defaults(func=cmd_train)
 
@@ -437,12 +482,23 @@ def build_parser():
     orch_resume = orch_sub.add_parser("resume", help="Resume an experiment plan")
     orch_resume.set_defaults(func=cmd_orch_resume)
 
+    sp_test = sp.add_parser("test", help="Run tests")
+    test_sub = sp_test.add_subparsers(dest="test_cmd", required=True, title="test commands")
+    test_convert = test_sub.add_parser("convert", help="Test conversion with random files")
+    test_convert.add_argument("--num-files", type=int, default=5, help="Number of test files per label (default: 5)")
+    test_convert.add_argument("--no-cleanup", action="store_true", help="Don't clean up test files after test")
+    test_convert.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    test_convert.set_defaults(func=cmd_test)
+
     return ap
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    if hasattr(args, "func") and callable(args.func):
+        args.func(args)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()

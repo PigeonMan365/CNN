@@ -14,7 +14,7 @@ What it prints:
 - Cache recommendations based on free disk at cache_root
 
 What it CREATES if missing (non-destructive):
-- dataset/output/{compress,truncate}/{benign,malware}
+- dataset/output/{benign,malware}/{resize,truncate}
 - logs/, cache/
 - logs/conversion_log.csv rebuilt by scanning dataset/output/*
 """
@@ -212,9 +212,9 @@ def rebuild_conversion_log_from_dataset(images_root: Path, log_csv: Path) -> int
     """
     Walk dataset/output and rebuild logs/conversion_log.csv with:
       rel_path,label,mode,sha256
-    mode   = {compress, truncate} (top-level folder under images_root)
-    label  = 1 if 'malware' folder, 0 if 'benign'
-    rel_path = POSIX path relative to images_root (e.g., 'compress/malware/foo.png')
+    label  = 1 if 'malware' folder, 0 if 'benign' (top-level folder under images_root)
+    mode   = {resize, truncate} (second-level folder under images_root)
+    rel_path = POSIX path relative to images_root (e.g., 'malware/resize/foo.png')
     sha256 = SHA-256 of the file contents
     Returns number of rows written (excluding header).
     """
@@ -224,9 +224,9 @@ def rebuild_conversion_log_from_dataset(images_root: Path, log_csv: Path) -> int
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
     rows = []
 
-    for mode in ("compress", "truncate"):
-        for cls, label in (("benign", 0), ("malware", 1)):
-            base = images_root / mode / cls
+    for cls, label in (("benign", 0), ("malware", 1)):
+        for mode in ("resize", "truncate"):
+            base = images_root / cls / mode
             if not base.exists():
                 continue
             for p in base.rglob("*"):
@@ -248,7 +248,7 @@ def rebuild_conversion_log_from_dataset(images_root: Path, log_csv: Path) -> int
 def ensure_project_skeleton(cfg: dict) -> tuple[Path, Path, Path]:
     """
     Ensure minimal non-destructive skeleton:
-      dataset/output/{compress,truncate}/{benign,malware}
+      dataset/output/{benign,malware}/{resize,truncate}
       logs/
       cache/
     Returns (images_root, data_csv, cache_root).
@@ -261,9 +261,9 @@ def ensure_project_skeleton(cfg: dict) -> tuple[Path, Path, Path]:
     cache_root  = Path(paths.get("cache_root", "cache")).resolve()
 
     # Create required dirs if missing (preserve existing)
-    for mode in ("compress", "truncate"):
-        for cls in ("benign", "malware"):
-            ensure_dir(images_root / mode / cls)
+    for cls in ("benign", "malware"):
+        for mode in ("resize", "truncate"):
+            ensure_dir(images_root / cls / mode)
 
     ensure_dir(cache_root)
     ensure_dir(data_csv.parent)

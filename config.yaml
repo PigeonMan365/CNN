@@ -7,7 +7,7 @@ paths:
   conversion_log: "logs/conversion_log.csv"
   tmp_root: "tmp"
   cache_root: "cache"
-  cache_max_bytes: "10GB"
+  cache_max_bytes: "33GB"
 
 train_io:
   data_csv: "logs/conversion_log.csv"
@@ -26,11 +26,11 @@ training:
       value: 0.001                 # 0.1% FPR
 
   # ===== Splits =====
-  kfold: 3
+  kfold: 1
   holdout: 20                      # used when kfold == 1
 
   # ===== Batching & imbalance =====
-  batch_size: 8
+  batch_size: 32
   oversample_pos_range: "0.05-0.10"  # ≈1:19...1:9 positives per batch
 
   # ===== Optimizer & schedule =====
@@ -40,15 +40,22 @@ training:
   weight_decay: 0.0001
   grad_clip: 1.0
 
+  # ===== Preprocessing target sizes =====
+  resize_target_size: [64, 64]      # Target size for resize mode (width, height)
+  truncate_target_size: [256, 256] # Target size for truncate mode (width, height)
+
   # ===== Performance =====
   epochs: 3                        # <— correct key; trainer reads this
-  num_workers: 4                   # trainer will force 0 on Windows automatically
-  prefetch_batches: 2
-  pin_memory: false
+  num_workers: 8                   # trainer will force 0 on Windows automatically
+  prefetch_batches: 4
+  pin_memory: true
   persistent_workers: true
-  amp: false
+  amp: true
   device: auto                     # auto | cpu | cuda
-  default_mode: compress  # or truncate, otherwise defaults to both
+  
+  # ===== Experiment mode =====
+  mode: both                     # resize | truncate | both
+                                  # When "both", trains two separate models (one for each method)
 
 
   # ===== Optional compile =====

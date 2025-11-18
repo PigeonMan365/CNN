@@ -1,6 +1,34 @@
 # Malware → Image Conversion + MalNet-FocusAug Training System
 
-This project converts binaries into grayscale images (compress + truncate modes) and trains a CNN (MalNet-FocusAug) with group-aware evaluation, resumable orchestration, reproducible exports, and TorchScript deployment.
+This project converts binaries into grayscale images using two preprocessing methods (resize + truncate modes) and trains a CNN (MalNet-FocusAug) with group-aware evaluation, resumable orchestration, reproducible exports, and TorchScript deployment.
+
+---
+
+## 0) Preprocessing Methods
+
+The system supports two preprocessing methods for comparative evaluation:
+
+### Resize Mode
+Maps all bytes to grayscale pixels (0-255) in byte order:
+- Uses fixed image width of 256 pixels
+- Computes dynamic height: `ceil(len(bytes) / 256)`
+- Pads only the final row with zeros to complete the last line
+- Resizes the resulting image to 256×256 using bilinear interpolation
+- Preserves all bytes and ensures uniform CNN input shape
+- Normalization to [0,1] occurs during training
+
+This method preserves all bytes and provides a complete view of the file structure.
+
+### Truncate Mode (Entropy-Aware)
+Selects the most informative regions of the file:
+- Fixed image size: 256×256 (65,536 bytes max)
+- Divides file into 512-byte chunks
+- Computes Shannon entropy per chunk
+- Selects top-N chunks with highest entropy
+- Concatenates selected chunks and maps to 256×256 image
+- Preserves the most informative regions and avoids wasting space on low-entropy headers or padding
+
+This method prioritizes high-entropy regions, which typically contain executable code or encrypted/packed data, while ignoring low-entropy padding or headers.
 
 ---
 
@@ -42,22 +70,26 @@ Apply any recommendations to `config.yaml` manually.
 
 ### 1.4 — Convert binaries (only needed when dataset/input changes)
 ```bash
-# runs preprocessing/dual_convert.py and both modes via converter.py
+# runs preprocessing/convert.py and converts files into both modes
 python main.py convert
 ```
 
 This populates:  
 ```
-dataset/output/compress/(benign|malware)/*.png
-dataset/output/truncate/(benign|malware)/*.png
+dataset/output/benign/resize/*.png      # Resize method (all bytes preserved)
+dataset/output/benign/truncate/*.png    # Entropy-aware (high-entropy chunks selected)
+dataset/output/malware/resize/*.png     # Resize method (all bytes preserved)
+dataset/output/malware/truncate/*.png   # Entropy-aware (high-entropy chunks selected)
 ```
+
+Each file is converted deterministically using its SHA256 hash as the filename, ensuring reproducible conversions.
 
 ---
 
 ### 1.5 — Train a single model
 ```bash
 python main.py train
-python main.py train --mode compress --seed 3
+python main.py train --mode resize --seed 3
 ```
 
 Exports appear in:
@@ -108,7 +140,7 @@ Concatenate → Linear(256→128) → ReLU → Linear(128→1).
 **preprocessing/** — safe binary → PNG conversion.  
 **training/** — dataset loader + CNN model code.  
 **export_models/** — TorchScript models saved for deployment.  
-**dataset/** — input binaries and converted PNGs organized by mode+label.
+**dataset/** — input binaries (dataset/input/{benign,malware}/) and converted PNGs (dataset/output/{benign,malware}/{resize,truncate}/).
 
 ---
 
