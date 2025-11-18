@@ -1,0 +1,22 @@
+# Inference configuration
+# 
+# IMPORTANT: For accurate metrics computation, organize input files as:
+#   input/benign/    - Files known to be benign
+#   input/malware/   - Files known to be malware
+# Without this structure, predictions will still work but metrics cannot be computed.
+#
+paths:
+  input_root: "input"
+  output_root: "output"
+  models_root: "models"
+  logs_root: "logs"
+
+inference:
+  # Preprocessing target sizes (must match training config)
+  resize_target_size: [64, 64]      # Target size for resize mode (width, height)
+  truncate_target_size: [256, 256]  # Target size for truncate mode (width, height)
+  
+  # Inference settings
+  threshold: 0.5                    # Probability threshold for binary classification
+  device: auto                      # auto | cpu | cuda
+
