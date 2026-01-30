@@ -13,11 +13,13 @@ Maps all bytes to grayscale pixels (0-255) in byte order:
 - Uses fixed image width of 256 pixels
 - Computes dynamic height: `ceil(len(bytes) / 256)`
 - Pads only the final row with zeros to complete the last line
-- Resizes the resulting image to 256×256 using bilinear interpolation
-- Preserves all bytes and ensures uniform CNN input shape
+- Resizes the resulting image to target_size (default 64×64) using bilinear interpolation
 - Normalization to [0,1] occurs during training
 
-This method preserves all bytes and provides a complete view of the file structure.
+**IMPORTANT**: The resize operation causes information loss. While all bytes are initially
+mapped to an intermediate image, downsampling to the target size (default 64×64 = 4,096 bytes)
+means the final output can only represent target_width × target_height bytes maximum.
+Larger files are downsampled and most bytes are lost during the resize operation.
 
 ### Truncate Mode (Entropy-Aware)
 Selects the most informative regions of the file:

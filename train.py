@@ -118,6 +118,7 @@ class TrainArgs:
     amp: bool = False
     runs_root: str = "runs"
     export_root: str = "export_models"
+    decode_cache_mem_mb: int = 0
 
 
 def parse_cli() -> TrainArgs:
@@ -228,6 +229,17 @@ def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
 
     # Seed handling - CLI override or auto-increment (handled elsewhere)
     seed = raw_cli.seed if raw_cli.seed is not None else _get(cfg, "training.seed", args.seed)
+    
+    # Decode cache: read from config, with mode-specific defaults
+    # Truncate mode benefits more from caching due to larger, expensive-to-decode PNGs
+    decode_cache_mem_mb = _get(cfg, "training.decode_cache_mem_mb", None)
+    if decode_cache_mem_mb is None:
+        # Mode-specific defaults: truncate gets more cache due to larger files
+        if mode == "truncate":
+            decode_cache_mem_mb = 1024  # 1GB default for truncate
+        else:
+            decode_cache_mem_mb = 0  # Disabled for resize by default
+    decode_cache_mem_mb = int(decode_cache_mem_mb)
 
     args = replace(
         args,
@@ -256,6 +268,7 @@ def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
         export_root=export_root,
         oversample_pos_min=oversample_pos_min,
         oversample_pos_max=oversample_pos_max,
+        decode_cache_mem_mb=decode_cache_mem_mb,
     )
 
     tr_cfg = _get(cfg, "training", {})
@@ -329,6 +342,10 @@ def build_grouped_stratified_folds(rows: List[Dict], k: int, seed: int) -> List[
 
 
 def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Build a stratified holdout split that maintains class balance.
+    Groups samples by SHA256 to prevent data leakage.
+    """
     assert 0 <= holdout_pct <= 50
     rng = check_random_state(seed)
     groups: Dict[str, Dict] = {}
@@ -337,16 +354,63 @@ def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[T
         groups.setdefault(g, {"idxs": [], "label": 0})
         groups[g]["idxs"].append(i)
         groups[g]["label"] = max(groups[g]["label"], y)
-    glist = list(groups.items()); rng.shuffle(glist)
-    N = len(rows); target = int(round(N * (holdout_pct / 100.0)))
+    
+    # Separate positive and negative groups
+    pos_groups = [(g, v) for g, v in groups.items() if v["label"] == 1]
+    neg_groups = [(g, v) for g, v in groups.items() if v["label"] == 0]
+    rng.shuffle(pos_groups)
+    rng.shuffle(neg_groups)
+    
+    # Calculate target sizes for each class to maintain balance
+    N = len(rows)
+    target_total = int(round(N * (holdout_pct / 100.0)))
+    
+    # Count samples per class
+    n_pos_total = sum(len(v["idxs"]) for _, v in pos_groups)
+    n_neg_total = sum(len(v["idxs"]) for _, v in neg_groups)
+    
+    # Allocate validation samples proportionally to class distribution
+    if n_pos_total > 0 and n_neg_total > 0:
+        pos_ratio = n_pos_total / N
+        target_pos = max(1, int(round(target_total * pos_ratio)))  # At least 1 positive
+        target_neg = target_total - target_pos
+    elif n_pos_total > 0:
+        # Only positive samples
+        target_pos = min(target_total, n_pos_total)
+        target_neg = 0
+    elif n_neg_total > 0:
+        # Only negative samples
+        target_pos = 0
+        target_neg = min(target_total, n_neg_total)
+    else:
+        # No samples (shouldn't happen)
+        target_pos = 0
+        target_neg = 0
+    
+    # Select groups for validation set, maintaining class balance
     val_idxs = []
-    for _, v in glist:
-        if len(val_idxs) >= target:
+    
+    # Add positive groups
+    pos_count = 0
+    for g, v in pos_groups:
+        if pos_count >= target_pos:
             break
         val_idxs.extend(v["idxs"])
+        pos_count += len(v["idxs"])
+    
+    # Add negative groups
+    neg_count = 0
+    for g, v in neg_groups:
+        if neg_count >= target_neg:
+            break
+        val_idxs.extend(v["idxs"])
+        neg_count += len(v["idxs"])
+    
     val_idx = np.array(sorted(val_idxs), dtype=int)
-    mask = np.ones(N, dtype=bool); mask[val_idx] = False
+    mask = np.ones(N, dtype=bool)
+    mask[val_idx] = False
     train_idx = np.arange(N, dtype=int)[mask]
+    
     return [(train_idx, val_idx)]
 
 
@@ -399,20 +463,61 @@ class StratifiedRatioBatchSampler(BatchSampler):
 def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -> Dict[str, float]:
     y_true = labels.astype(int)
     y_score = scores.astype(float)
-    try:
-        roc_auc = roc_auc_score(y_true, y_score)
-    except Exception:
-        roc_auc = float("nan")
-    try:
-        pr_auc = average_precision_score(y_true, y_score)
-    except Exception:
-        pr_auc = float("nan")
+    
+    # Count positive and negative samples
+    n_pos = int(y_true.sum())
+    n_neg = int((1 - y_true).sum())
+    
+    # Handle edge case: no positive samples
+    if n_pos == 0:
+        # Return NaN for metrics that require positive samples
+        return {
+            "pr_auc": float("nan"),
+            "roc_auc": float("nan"),
+            "f1_max": float("nan"),
+            "thr_f1_max": float("nan"),
+            "thr_op": float("nan"),
+            "f1_at_op": float("nan"),
+            "tpr_at_op": float("nan"),
+            "fpr_at_op": float("nan"),
+            "support_pos": 0,
+            "support_neg": n_neg,
+        }
+    
+    # Handle edge case: no negative samples
+    if n_neg == 0:
+        # Perfect classifier case
+        return {
+            "pr_auc": 1.0,
+            "roc_auc": 1.0,
+            "f1_max": 1.0,
+            "thr_f1_max": 0.5,
+            "thr_op": 0.5,
+            "f1_at_op": 1.0,
+            "tpr_at_op": 1.0,
+            "fpr_at_op": 0.0,
+            "support_pos": n_pos,
+            "support_neg": 0,
+        }
+    
+    # Normal case: compute metrics with warnings suppressed
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+        try:
+            roc_auc = roc_auc_score(y_true, y_score)
+        except Exception:
+            roc_auc = float("nan")
+        try:
+            pr_auc = average_precision_score(y_true, y_score)
+        except Exception:
+            pr_auc = float("nan")
 
-    P, R, T = precision_recall_curve(y_true, y_score)
-    f1s = (2 * P * R) / np.clip(P + R, 1e-12, None)
-    f1_idx = int(np.nanargmax(f1s)) if len(f1s) else 0
-    f1_max = float(f1s[f1_idx]) if len(f1s) else float("nan")
-    thr_f1_max = float(T[max(0, f1_idx - 1)]) if len(T) > 0 else 0.5
+        P, R, T = precision_recall_curve(y_true, y_score)
+        f1s = (2 * P * R) / np.clip(P + R, 1e-12, None)
+        f1_idx = int(np.nanargmax(f1s)) if len(f1s) else 0
+        f1_max = float(f1s[f1_idx]) if len(f1s) else float("nan")
+        thr_f1_max = float(T[max(0, f1_idx - 1)]) if len(T) > 0 else 0.5
 
     uniq = np.unique(y_score)
     thr_candidates = np.r_[uniq[::-1], -np.inf]
@@ -445,8 +550,8 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -
         "f1_at_op": float(f1_at_op),
         "tpr_at_op": float(best_tpr),
         "fpr_at_op": float(best_fpr),
-        "support_pos": int(y_true.sum()),
-        "support_neg": int((1 - y_true).sum()),
+        "support_pos": n_pos,
+        "support_neg": n_neg,
     }
 
 
@@ -589,6 +694,9 @@ def train_run(cfg: TrainArgs):
     expected_size = resize_size if cfg.mode == "resize" else truncate_size
     print(f"[INFO] Mode: {cfg.mode}, expected image size: {expected_size[0]}x{expected_size[1]}")
 
+    # Create dataset (loads all rows from CSV)
+    # Use mode-specific decode cache (truncate gets 1GB default, resize gets 0)
+    # Pass target_size so dataset can resize on-the-fly if PNGs don't match config
     dataset = ByteImageDataset(
         csv_path=str(cfg.data_csv),
         images_root=str(cfg.images_root),
@@ -596,13 +704,94 @@ def train_run(cfg: TrainArgs):
         use_disk_cache=True,
         cache_root="cache",
         cache_max_bytes="40GB",
-        decode_cache_mem_mb=0,
+        decode_cache_mem_mb=cfg.decode_cache_mem_mb,
+        target_size=tuple(expected_size),  # (width, height) - enables on-the-fly resizing
     )
+    
+    if cfg.decode_cache_mem_mb > 0:
+        print(f"[INFO] Tensor cache enabled: {cfg.decode_cache_mem_mb} MB (decoded PNGs cached in RAM)")
+    else:
+        print(f"[INFO] Tensor cache disabled (decode_cache_mem_mb=0)")
+    
+    # Diagnostic: Check actual image dimensions vs expected
+    if len(rows) > 0:
+        from PIL import Image
+        sample_size = min(20, len(rows))  # Sample first 20 files
+        actual_sizes = []
+        file_sizes = []
+        images_root_path = Path(cfg.images_root)
+        for i in range(sample_size):
+            row = rows[i]
+            img_path = images_root_path / row["rel_path"]
+            if img_path.exists():
+                try:
+                    with Image.open(img_path) as img:
+                        actual_sizes.append(img.size)  # (width, height)
+                    file_sizes.append(img_path.stat().st_size)
+                except Exception:
+                    pass
+        
+        if actual_sizes:
+            # Get most common size
+            from collections import Counter
+            size_counts = Counter(actual_sizes)
+            most_common_size = size_counts.most_common(1)[0][0]
+            most_common_count = size_counts.most_common(1)[0][1]
+            
+            print(f"[INFO] Actual PNG dimensions (sampled {len(actual_sizes)} files):")
+            print(f"  Most common: {most_common_size[0]}x{most_common_size[1]} ({most_common_count}/{len(actual_sizes)} files)")
+            print(f"  Expected from config: {expected_size[0]}x{expected_size[1]}")
+            
+            if most_common_size != tuple(expected_size):
+                print(f"[WARN] Image dimensions don't match config!")
+                print(f"[WARN] PNGs on disk are {most_common_size[0]}x{most_common_size[1]}, but config expects {expected_size[0]}x{expected_size[1]}")
+                print(f"[WARN] Dataset will resize images on-the-fly to match config (this may slow down training)")
+                print(f"[WARN] To fix: re-run 'python main.py convert' with the new target_size to regenerate PNGs")
+            
+            avg_file_size_kb = (sum(file_sizes) / len(file_sizes)) / 1024
+            print(f"[INFO] Average PNG file size: {avg_file_size_kb:.1f} KB")
+            if cfg.mode == "truncate" and avg_file_size_kb > 30:
+                print(f"[INFO] Truncate files are large ({avg_file_size_kb:.1f} KB avg) due to high-entropy content.")
+                print(f"[INFO] Consider: increasing decode_cache_mem_mb for faster repeated access, or using larger cache_max_bytes.")
+    
+    # Create mapping from filtered row indices to dataset indices
+    # The dataset loads ALL rows, but rows is filtered by mode
+    # We need to map filtered_row_idx -> dataset_idx
+    print(f"[INFO] Building index mapping: filtered rows ({len(rows)}) -> dataset items ({len(dataset)})")
+    filtered_to_dataset_idx = []
+    dataset_to_filtered_idx = {}  # Reverse mapping for validation
+    
+    # Build mapping by matching rel_path and sha256
+    for filtered_idx, row in enumerate(rows):
+        row_rel = row["rel_path"]
+        row_sha = row["sha256"]
+        row_label = row["label"]
+        
+        # Find matching item in dataset
+        for dataset_idx, (item_rel, item_label, item_sha) in enumerate(dataset.items):
+            if item_rel == row_rel and item_sha == row_sha and item_label == row_label:
+                filtered_to_dataset_idx.append(dataset_idx)
+                dataset_to_filtered_idx[dataset_idx] = filtered_idx
+                break
+        else:
+            # If not found, this is a problem - filtered row doesn't exist in dataset
+            raise ValueError(
+                f"Filtered row {filtered_idx} (rel_path={row_rel}, sha256={row_sha}) "
+                f"not found in dataset. This indicates a mismatch between CSV filtering and dataset loading."
+            )
+    
+    if len(filtered_to_dataset_idx) != len(rows):
+        raise ValueError(
+            f"Index mapping incomplete: {len(filtered_to_dataset_idx)}/{len(rows)} rows mapped. "
+            f"Dataset may be missing rows or have duplicates."
+        )
+    
+    print(f"[INFO] Index mapping complete: {len(filtered_to_dataset_idx)} rows mapped")
 
     device = torch.device("cuda" if (cfg.device == "cuda" or (cfg.device == "auto" and torch.cuda.is_available())) else "cpu")
     print(f"[INFO] Using device: {device}")
 
-    best_overall = {"pr_auc": -1.0, "fold": -1, "ckpt_path": ""}
+    best_overall = {"pr_auc": float("-inf"), "fold": -1, "ckpt_path": ""}
 
     # Optional resume discovery for this (mode,seed) run
     resume_state = None
@@ -625,16 +814,48 @@ def train_run(cfg: TrainArgs):
     for fi, (train_idx, val_idx) in enumerate(splits, start=1):
         print(f"\n=== Fold {fi}/{len(splits)} ===")
         print(f"[DEBUG] fold sizes -> train: {len(train_idx)} | val: {len(val_idx)}")
+        
+        # Map filtered row indices to dataset indices
+        train_dataset_idx = np.array([filtered_to_dataset_idx[i] for i in train_idx], dtype=int)
+        val_dataset_idx = np.array([filtered_to_dataset_idx[i] for i in val_idx], dtype=int)
+        
+        # Show class distribution in train/val splits (from filtered rows)
+        train_labels_split = np.array([rows[i]['label'] for i in train_idx], dtype=int)
+        val_labels_split = np.array([rows[i]['label'] for i in val_idx], dtype=int)
+        train_pos = int(train_labels_split.sum())
+        train_neg = len(train_labels_split) - train_pos
+        val_pos = int(val_labels_split.sum())
+        val_neg = len(val_labels_split) - val_pos
+        print(f"[DEBUG] class distribution -> train: pos={train_pos} neg={train_neg} | val: pos={val_pos} neg={val_neg}")
+        
+        if val_pos == 0:
+            print(f"[WARN] Validation set has no positive samples! This will cause metric computation issues.")
+            print(f"[WARN] Consider using kfold > 1 for stratified cross-validation, or check your dataset balance.")
 
         # Skip completed folds when resuming
         if resume_state and fi < resume_state['fold']:
             print(f"[RESUME] Skipping fold {fi} (completed previously).")
             continue
 
-        ds_train = Subset(dataset, train_idx)
-        ds_val   = Subset(dataset, val_idx)
+        # Create subsets using dataset indices
+        ds_train = Subset(dataset, train_dataset_idx)
+        ds_val   = Subset(dataset, val_dataset_idx)
 
-        train_labels = np.array([rows[i]['label'] for i in train_idx], dtype=int)
+        # Verify labels match between filtered rows and dataset
+        # Sample a few indices to verify
+        sample_indices = np.concatenate([train_dataset_idx[:min(5, len(train_dataset_idx))], 
+                                        val_dataset_idx[:min(5, len(val_dataset_idx))]])
+        for dataset_idx in sample_indices:
+            filtered_idx = dataset_to_filtered_idx.get(dataset_idx)
+            if filtered_idx is not None:
+                dataset_label = dataset.items[dataset_idx][1]  # label is at index 1
+                row_label = rows[filtered_idx]['label']
+                if dataset_label != row_label:
+                    print(f"[WARN] Label mismatch at dataset_idx={dataset_idx}, filtered_idx={filtered_idx}: "
+                          f"dataset={dataset_label}, row={row_label}")
+
+        # Reuse train_labels_split computed above
+        train_labels = train_labels_split
         batch_sampler = StratifiedRatioBatchSampler(
             train_labels, cfg.batch_size,
             cfg.oversample_pos_min, cfg.oversample_pos_max,
@@ -683,7 +904,7 @@ def train_run(cfg: TrainArgs):
 
         ckpt_dir = runs_root
         ensure_dir(ckpt_dir)
-        fold_best = {"pr_auc": -1.0, "epoch": -1, "path": ""}
+        fold_best = {"pr_auc": float("-inf"), "epoch": -1, "path": ""}
 
         try:
             # Determine starting epoch if resuming this fold
@@ -719,18 +940,45 @@ def train_run(cfg: TrainArgs):
                 val_loss, val_logits, val_labels = one_epoch(model, val_loader, device,optimizer=None, desc=f"val   f{fi} e{epoch}")
 
                 val_scores = sigmoid_np(val_logits)
+                
+                # Debug: Check actual labels from dataset on first epoch
+                if epoch == 1:
+                    actual_pos = int(val_labels.sum())
+                    actual_neg = len(val_labels) - actual_pos
+                    expected_pos = int(val_labels_split.sum())
+                    expected_neg = len(val_labels_split) - expected_pos
+                    if actual_pos != expected_pos or actual_neg != expected_neg:
+                        print(f"[ERROR] Label mismatch detected!")
+                        print(f"[ERROR] Expected from split: pos={expected_pos}, neg={expected_neg}")
+                        print(f"[ERROR] Actual from dataset: pos={actual_pos}, neg={actual_neg}")
+                        print(f"[ERROR] This indicates the dataset indices don't match the filtered row indices.")
+                        print(f"[ERROR] Check the index mapping logic.")
+                
                 metrics = compute_metrics(val_scores, val_labels, cfg.fpr_budget)
                 acc05 = float(((val_scores >= 0.5).astype(int) == val_labels).mean()) if len(val_labels) > 0 else float("nan")
+
+                # Format metrics with NaN handling
+                def fmt_metric(v):
+                    if np.isnan(v):
+                        return "nan"
+                    return f"{v:.3f}"
+                
+                # Warn if no positive samples in validation
+                if metrics["support_pos"] == 0:
+                    print(f"[WARN] Validation set has no positive samples (pos={metrics['support_pos']}, neg={metrics['support_neg']})")
+                    print(f"[WARN] Metrics requiring positive samples will be NaN. Consider adjusting your split or dataset.")
 
                 print(
                     f"Epoch {epoch}/{cfg.epochs}: "
                     f"train_loss={tr_loss:.4f} | val_loss={val_loss:.4f} acc@0.5={acc05:.3f} | "
-                    f"val: pr_auc={metrics['pr_auc']:.3f} roc_auc={metrics['roc_auc']:.3f} f1_max={metrics['f1_max']:.3f} | "
-                    f"op: thr={metrics['thr_op']:.3f} f1={metrics['f1_at_op']:.3f} tpr={metrics['tpr_at_op']:.3f} fpr={metrics['fpr_at_op']:.4f}"
+                    f"val: pr_auc={fmt_metric(metrics['pr_auc'])} roc_auc={fmt_metric(metrics['roc_auc'])} f1_max={fmt_metric(metrics['f1_max'])} | "
+                    f"op: thr={fmt_metric(metrics['thr_op'])} f1={fmt_metric(metrics['f1_at_op'])} tpr={fmt_metric(metrics['tpr_at_op'])} fpr={fmt_metric(metrics['fpr_at_op'])}"
                 )
 
-                if metrics["pr_auc"] > fold_best["pr_auc"]:
-                    fold_best.update({"pr_auc": metrics["pr_auc"], "epoch": epoch})
+                # Update best checkpoint if pr_auc is valid and better
+                pr_auc_val = metrics["pr_auc"]
+                if not np.isnan(pr_auc_val) and pr_auc_val > fold_best["pr_auc"]:
+                    fold_best.update({"pr_auc": pr_auc_val, "epoch": epoch})
                     ckpt_path = ckpt_dir / f"fold{fi}_best.pt"
                     torch.save({
                         "model": model.state_dict(),
@@ -744,7 +992,7 @@ def train_run(cfg: TrainArgs):
                         "fold": fi,
                     }, ckpt_path)
                     fold_best["path"] = str(ckpt_path)
-                    print(f"[CHECKPOINT] Saved fold {fi} best @ epoch {epoch} pr_auc={metrics['pr_auc']:.3f} -> {ckpt_path}")
+                    print(f"[CHECKPOINT] Saved fold {fi} best @ epoch {epoch} pr_auc={pr_auc_val:.3f} -> {ckpt_path}")
 
                 if interrupted["flag"]:
                     ckpt_path = ckpt_dir / f"fold{fi}_interrupt.pt"
@@ -765,19 +1013,28 @@ def train_run(cfg: TrainArgs):
         finally:
             signal.signal(signal.SIGINT, old_handler)
 
-        print(f"[FOLD {fi}] best pr_auc={fold_best['pr_auc']:.3f} @ epoch {fold_best['epoch']}")
+        pr_auc_fold = fold_best['pr_auc']
+        if np.isnan(pr_auc_fold):
+            print(f"[FOLD {fi}] best pr_auc=nan @ epoch {fold_best['epoch']} (no valid metrics)")
+        else:
+            print(f"[FOLD {fi}] best pr_auc={pr_auc_fold:.3f} @ epoch {fold_best['epoch']}")
         if fold_best["path"]:
             print(f"[CHECKPOINT] Saved fold {fi} best state to: {fold_best['path']}")
 
-        if fold_best["pr_auc"] > best_overall["pr_auc"]:
-            best_overall.update({"pr_auc": fold_best["pr_auc"], "fold": fi, "ckpt_path": fold_best["path"]})
+        # Update best overall only if pr_auc is valid and better
+        if not np.isnan(pr_auc_fold) and pr_auc_fold > best_overall["pr_auc"]:
+            best_overall.update({"pr_auc": pr_auc_fold, "fold": fi, "ckpt_path": fold_best["path"]})
 
     # ---------- Export best fold ----------
     if not best_overall["ckpt_path"]:
         print("[WARN] No best checkpoint found; skipping export.")
         return
 
-    print(f"[SELECT] Best fold: {best_overall['fold']} pr_auc={best_overall['pr_auc']:.3f}")
+    pr_auc_best = best_overall['pr_auc']
+    if np.isnan(pr_auc_best) or pr_auc_best == float("-inf"):
+        print(f"[SELECT] Best fold: {best_overall['fold']} pr_auc=nan (no valid metrics found)")
+    else:
+        print(f"[SELECT] Best fold: {best_overall['fold']} pr_auc={pr_auc_best:.3f}")
     state = torch.load(best_overall["ckpt_path"], map_location="cpu")
     model = MalNetFocusAug(attention=True).eval()
     model.load_state_dict(state["model"], strict=False)

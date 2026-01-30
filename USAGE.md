@@ -70,8 +70,10 @@ python main.py verify --config custom_config.yaml
 **What it does**:
 - Scans `dataset/input/{benign,malware}/` for files
 - Converts each file using both methods:
-  - **Resize mode**: Maps all bytes to grayscale, dynamic height, resizes to 256×256
-  - **Truncate mode**: Entropy-aware selection of high-information chunks, maps to 256×256
+  - **Resize mode**: Maps all bytes to grayscale, dynamic height, resizes to target_size (default 64×64)
+    - NOTE: Information loss occurs during resize - only 4,096 bytes can be represented in 64×64 output
+  - **Truncate mode**: Entropy-aware selection of high-information chunks, maps to target_size (default 256×256)
+    - Can represent up to 65,536 bytes in 256×256 output
 - Outputs to `dataset/output/{benign,malware}/{resize,truncate}/`
 - Each PNG is named using the file's SHA256 hash (deterministic)
 - Skips files that already have converted images (idempotent)

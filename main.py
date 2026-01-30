@@ -9,11 +9,14 @@ subcommands:
   convert       : convert binaries -> images (both modes) + rebuild conversion log
   train         : train a model (auto-resume if an interrupt exists; else config-driven new run)
   reset         : clear runs/cache/logs/tmp/exports, PRESERVE dataset, rebuild conversion_log.csv
+  clear         : clear dataset/output/ and conversion_log.csv; preserve dataset/input/
+  generate      : generate random test files (500 bits to 500KB) in input folders
   orchestrate   : plan/resume multi-run experiments via orchestrate.py
 
 notes:
 - seeds are tracked in runs/seed_state.json
 - "train --mode both" trains resize and truncate with the SAME seed, then advances it
+- use "clear" before re-converting with new target sizes in config
 """
 
 from __future__ import annotations
@@ -397,6 +400,44 @@ def cmd_reset(_args):
 
     print("[reset] project reset complete (dataset preserved).")
 
+# ----------------- subcommand: clear -----------------
+
+def cmd_clear(_args):
+    """
+    Clear dataset/output/ (all converted PNGs) and logs/conversion_log.csv.
+    Preserves dataset/input/ (original binary files).
+    Useful when you need to re-convert with different target sizes.
+    """
+    cfg = load_cfg(None)
+    paths = cfg.get("paths", {})
+    ti    = cfg.get("train_io", {})
+    
+    images_root = Path(ti.get("images_root", paths.get("images_root", "dataset/output"))).resolve()
+    conv_csv = Path(paths.get("conversion_log", ti.get("data_csv", "logs/conversion_log.csv"))).resolve()
+    
+    # Clear all converted images
+    if images_root.exists():
+        print(f"[clear] Removing all converted images from: {images_root}")
+        subprocess.run([sys.executable, "-c", "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", str(images_root)], check=False)
+    
+    # Recreate directory structure
+    ensure_dir(images_root)
+    for cls in ("benign", "malware"):
+        for mode in ("resize", "truncate"):
+            ensure_dir(images_root / cls / mode)
+    
+    # Clear conversion log
+    ensure_dir(conv_csv.parent)
+    if conv_csv.exists():
+        conv_csv.unlink(missing_ok=True)
+        print(f"[clear] Removed conversion log: {conv_csv}")
+    
+    # Create empty conversion log with header
+    conv_csv.write_text("rel_path,label,mode,sha256\n", encoding="utf-8")
+    print(f"[clear] Created empty conversion log: {conv_csv}")
+    
+    print("[clear] Output dataset cleared. Run 'python main.py convert' to regenerate images with current config settings.")
+
 # ----------------- subcommand: orchestrate -----------------
 
 def cmd_orch_plan(args):
@@ -419,6 +460,57 @@ def cmd_orch_resume(_args):
     cmd = [py, str(orch), "resume"]
     print("> " + " ".join(cmd))
     subprocess.run(cmd, check=False)
+
+# ----------------- subcommand: generate -----------------
+
+def cmd_generate(args):
+    """
+    Generate random test files in input folders.
+    Creates 50 files per label (benign, malware) with random sizes
+    between 500 bits (63 bytes) and 500KB (512000 bytes).
+    """
+    import random
+    
+    cfg = load_cfg(getattr(args, "config", None))
+    paths = cfg.get("paths", {})
+    input_roots = paths.get("input_roots", ["dataset/input"])
+    
+    num_files = getattr(args, "num_files", 50)
+    min_size = 63  # 500 bits = 62.5 bytes, round to 63
+    max_size = 512000  # 500KB = 500 * 1024 bytes
+    
+    print(f"[generate] Generating {num_files} random files per label")
+    print(f"[generate] Size range: {min_size} bytes ({min_size*8} bits) to {max_size} bytes ({max_size/1024:.1f} KB)")
+    
+    total_generated = 0
+    for input_root_str in input_roots:
+        input_root = Path(input_root_str).resolve()
+        print(f"[generate] Processing input root: {input_root}")
+        
+        for label in ("benign", "malware"):
+            label_dir = input_root / label
+            ensure_dir(label_dir)
+            
+            # Generate files
+            for i in range(num_files):
+                # Random file size between min_size and max_size
+                file_size = random.randint(min_size, max_size)
+                
+                # Generate random bytes
+                file_content = os.urandom(file_size)
+                
+                # Create filename with index and size info
+                filename = f"random_{label}_{i:03d}_{file_size}b.bin"
+                file_path = label_dir / filename
+                
+                # Write file
+                file_path.write_bytes(file_content)
+                total_generated += 1
+            
+            print(f"[generate] Generated {num_files} files in {label_dir}")
+    
+    print(f"[generate] Total files generated: {total_generated}")
+    print(f"[generate] Files are ready in: {', '.join(input_roots)}")
 
 # ----------------- subcommand: test -----------------
 
@@ -473,6 +565,13 @@ def build_parser():
 
     sp_reset = sp.add_parser("reset", help="Clear runs/cache/logs/tmp/export_models; preserve dataset; rebuild CSV.")
     sp_reset.set_defaults(func=cmd_reset)
+
+    sp_clear = sp.add_parser("clear", help="Clear dataset/output/ and conversion_log.csv; preserve dataset/input/. Use before re-converting with new target sizes.")
+    sp_clear.set_defaults(func=cmd_clear)
+
+    sp_generate = sp.add_parser("generate", help="Generate random test files in input folders.")
+    sp_generate.add_argument("--num-files", type=int, default=50, help="Number of files to generate per label (default: 50)")
+    sp_generate.set_defaults(func=cmd_generate)
 
     sp_orch = sp.add_parser("orchestrate", help="Plan/resume orchestrated experiments")
     orch_sub = sp_orch.add_subparsers(dest="orch_cmd", required=True)

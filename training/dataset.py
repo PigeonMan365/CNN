@@ -70,10 +70,12 @@ class ByteImageDataset(Dataset):
         cache_root: str = "cache",
         cache_max_bytes: str = "40GB",
         decode_cache_mem_mb: int = 0,
+        target_size: Optional[Tuple[int, int]] = None,
     ):
         self.csv_path = Path(csv_path)
         self.images_root = Path(images_root)
         self.normalize = (normalize or "01").lower() if normalize else None
+        self.target_size = target_size  # (width, height) or None to use image as-is
 
         # Load CSV rows
         self.items: List[Tuple[str, int, str]] = []  # (rel_or_abs, label, sha256)
@@ -123,12 +125,12 @@ class ByteImageDataset(Dataset):
         return self.file_cache.stage(p)
 
     def _png_to_tensor(self, path: Path) -> torch.Tensor:
-        # Build a cache key that invalidates when file changes.
+        # Build a cache key that invalidates when file changes or target_size changes.
         try:
             st = path.stat()
-            key = (str(path), st.st_mtime_ns, st.st_size, self.normalize)
+            key = (str(path), st.st_mtime_ns, st.st_size, self.normalize, self.target_size)
         except FileNotFoundError:
-            key = (str(path), 0, 0, self.normalize)
+            key = (str(path), 0, 0, self.normalize, self.target_size)
 
         if self.tensor_cache is not None:
             t = self.tensor_cache.get(key)
@@ -136,6 +138,14 @@ class ByteImageDataset(Dataset):
                 return t
 
         img = Image.open(path).convert("L")  # 8-bit grayscale
+        
+        # Resize if target_size is specified and image doesn't match
+        if self.target_size is not None:
+            target_w, target_h = self.target_size
+            if img.size != (target_w, target_h):
+                # Use LANCZOS resampling for quality (same as conversion uses)
+                img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        
         arr = np.array(img, dtype=np.float32)
         if self.normalize == "01":
             arr = arr / 255.0

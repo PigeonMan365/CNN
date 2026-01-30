@@ -7,7 +7,7 @@ paths:
   conversion_log: "logs/conversion_log.csv"
   tmp_root: "tmp"
   cache_root: "cache"
-  cache_max_bytes: "33GB"
+  cache_max_bytes: "60GB"
 
 train_io:
   data_csv: "logs/conversion_log.csv"
@@ -31,7 +31,7 @@ training:
 
   # ===== Batching & imbalance =====
   batch_size: 32
-  oversample_pos_range: "0.05-0.10"  # ≈1:19...1:9 positives per batch
+  oversample_pos_range: "1"  # ≈1:19...1:9 positives per batch
 
   # ===== Optimizer & schedule =====
   optimizer: adamw                 # adam | adamw
@@ -41,20 +41,44 @@ training:
   grad_clip: 1.0
 
   # ===== Preprocessing target sizes =====
-  resize_target_size: [64, 64]      # Target size for resize mode (width, height)
+  # To minimize information loss in resize mode, increase resize_target_size:
+  #   [64, 64] = 4,096 bytes max (default, high information loss)
+  #   [256, 256] = 65,536 bytes max (16x more data, minimal loss for most files)
+  #   [512, 512] = 262,144 bytes max (64x more data, preserves most files)
+  # Note: Larger sizes require more memory and compute during training
+  resize_target_size: [256, 256]      # Target size for resize mode (width, height)
   truncate_target_size: [256, 256] # Target size for truncate mode (width, height)
 
+  # ===== Resize method improvements =====
+  # These options help preserve more information without increasing image size:
+  resize_interpolation: lanczos    # Interpolation method: 'bilinear', 'bicubic', 'lanczos', 'area'
+                                    # Lanczos preserves sharpness best; area is fastest
+  resize_entropy_hybrid: false      # Enable hybrid entropy + uniform sampling to preserve both detail and structure
+  resize_entropy_ratio: 0.6         # Fraction of rows selected by entropy (0.0-1.0). Remaining are uniform.
+                                    # Default 0.6 means 60% entropy-based, 40% uniform sampling
+  # Note: Fractional progressive downsampling is always applied (no config option needed)
+  truncate_chunk_size: 512          # Base chunk size for truncate mode (adaptive per file/entropy)
+  truncate_entropy_stratify: true   # Enable multi-entropy sampling (top/mid/low bands)
+  truncate_entropy_weighted: false  # Allocate pixels proportionally to entropy instead of hard selection
+  truncate_use_frequency: false     # Augment entropy with byte-frequency/n-gram dispersion
+  # Expected PNG file sizes (with optimization enabled):
+  #   resize 64×64: ~3-8 KB (depending on content entropy)
+  #   truncate 256×256: ~20-60 KB (high-entropy data compresses poorly)
+
   # ===== Performance =====
-  epochs: 3                        # <— correct key; trainer reads this
+  epochs: 1                        # <— correct key; trainer reads this
   num_workers: 8                   # trainer will force 0 on Windows automatically
   prefetch_batches: 4
   pin_memory: true
   persistent_workers: true
   amp: true
   device: auto                     # auto | cpu | cuda
-  
+  decode_cache_mem_mb: null        # In-RAM tensor cache size in MB (null = auto: 1024 for truncate, 0 for resize)
+                                    # Caches decoded PNG tensors to avoid re-decoding. Higher values help with
+                                    # truncate mode's large, expensive-to-decode PNGs. Set to 0 to disable.
+
   # ===== Experiment mode =====
-  mode: both                     # resize | truncate | both
+  mode: resize                     # resize | truncate | both
                                   # When "both", trains two separate models (one for each method)
 
 
