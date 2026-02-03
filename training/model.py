@@ -80,15 +80,14 @@ class MalNetFocusAug(nn.Module):
     Args:
         attention: Ignored (kept for API compatibility). No attention is used.
     """
-    def __init__(self, attention: bool = True):
+    def __init__(self, input_size=256, attention: bool = True):
         super().__init__()
         # Default to S=256 for initialization (channels: 32, 32, 64, 128)
         # Model will work with any S divisible by 8
-        default_s = 256
-        c_stem = default_s // 8
-        c1 = default_s // 8
-        c2 = default_s // 4
-        c3 = default_s // 2
+        c_stem = input_size // 8
+        c1 = input_size // 8
+        c2 = input_size // 4
+        c3 = input_size // 2
         
         # Stem
         self.stem = nn.Sequential(

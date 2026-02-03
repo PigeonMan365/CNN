@@ -7,7 +7,7 @@ paths:
   conversion_log: "logs/conversion_log.csv"
   tmp_root: "tmp"
   cache_root: "cache"
-  cache_max_bytes: "60GB"
+  cache_max_bytes: "10GB"
 
 train_io:
   data_csv: "logs/conversion_log.csv"
@@ -26,11 +26,11 @@ training:
       value: 0.001                 # 0.1% FPR
 
   # ===== Splits =====
-  kfold: 1
+  kfold: 3
   holdout: 20                      # used when kfold == 1
 
   # ===== Batching & imbalance =====
-  batch_size: 32
+  batch_size: 16
   oversample_pos_range: "1"  # ≈1:19...1:9 positives per batch
 
   # ===== Optimizer & schedule =====
@@ -46,8 +46,8 @@ training:
   #   [256, 256] = 65,536 bytes max (16x more data, minimal loss for most files)
   #   [512, 512] = 262,144 bytes max (64x more data, preserves most files)
   # Note: Larger sizes require more memory and compute during training
-  resize_target_size: [256, 256]      # Target size for resize mode (width, height)
-  truncate_target_size: [256, 256] # Target size for truncate mode (width, height)
+  resize_target_size: [128, 128]      # Target size for resize mode (width, height)
+  truncate_target_size: [128, 128] # Target size for truncate mode (width, height)
 
   # ===== Resize method improvements =====
   # These options help preserve more information without increasing image size:
@@ -60,25 +60,25 @@ training:
   truncate_chunk_size: 512          # Base chunk size for truncate mode (adaptive per file/entropy)
   truncate_entropy_stratify: true   # Enable multi-entropy sampling (top/mid/low bands)
   truncate_entropy_weighted: false  # Allocate pixels proportionally to entropy instead of hard selection
-  truncate_use_frequency: false     # Augment entropy with byte-frequency/n-gram dispersion
+  truncate_use_frequency: true     # Augment entropy with byte-frequency/n-gram dispersion
   # Expected PNG file sizes (with optimization enabled):
   #   resize 64×64: ~3-8 KB (depending on content entropy)
   #   truncate 256×256: ~20-60 KB (high-entropy data compresses poorly)
 
   # ===== Performance =====
-  epochs: 1                        # <— correct key; trainer reads this
-  num_workers: 8                   # trainer will force 0 on Windows automatically
-  prefetch_batches: 4
-  pin_memory: true
+  epochs: 3                        # <— correct key; trainer reads this
+  num_workers: 4                   # trainer will force 0 on Windows automatically
+  prefetch_batches: 2
+  pin_memory: false
   persistent_workers: true
-  amp: true
+  amp: false
   device: auto                     # auto | cpu | cuda
   decode_cache_mem_mb: null        # In-RAM tensor cache size in MB (null = auto: 1024 for truncate, 0 for resize)
                                     # Caches decoded PNG tensors to avoid re-decoding. Higher values help with
                                     # truncate mode's large, expensive-to-decode PNGs. Set to 0 to disable.
 
   # ===== Experiment mode =====
-  mode: resize                     # resize | truncate | both
+  mode: both                     # resize | truncate | both
                                   # When "both", trains two separate models (one for each method)
 
 

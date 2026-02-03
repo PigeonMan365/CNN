@@ -880,7 +880,7 @@ def train_run(cfg: TrainArgs):
             collate_fn=collate_variable_size,  # Handle variable sizes gracefully
         )
 
-        model = MalNetFocusAug(attention=True).to(device)
+        model = MalNetFocusAug(input_size=expected_size[0], attention=True).to(device)
         if device.type == "cuda":
             model = model.to(memory_format=torch.channels_last)
 
@@ -1036,7 +1036,7 @@ def train_run(cfg: TrainArgs):
     else:
         print(f"[SELECT] Best fold: {best_overall['fold']} pr_auc={pr_auc_best:.3f}")
     state = torch.load(best_overall["ckpt_path"], map_location="cpu")
-    model = MalNetFocusAug(attention=True).eval()
+    model = MalNetFocusAug(input_size=expected_size[0], attention=True).eval()
     model.load_state_dict(state["model"], strict=False)
 
     export_dir = Path(cfg.export_root)
