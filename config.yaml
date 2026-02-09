@@ -26,7 +26,7 @@ training:
       value: 0.001                 # 0.1% FPR
 
   # ===== Splits =====
-  kfold: 3
+  kfold: 1
   holdout: 20                      # used when kfold == 1
 
   # ===== Batching & imbalance =====
@@ -46,8 +46,8 @@ training:
   #   [256, 256] = 65,536 bytes max (16x more data, minimal loss for most files)
   #   [512, 512] = 262,144 bytes max (64x more data, preserves most files)
   # Note: Larger sizes require more memory and compute during training
-  resize_target_size: [128, 128]      # Target size for resize mode (width, height)
-  truncate_target_size: [128, 128] # Target size for truncate mode (width, height)
+  resize_target_size: [64, 64]      # Target size for resize mode (width, height)
+  truncate_target_size: [64, 64] # Target size for truncate mode (width, height)
 
   # ===== Resize method improvements =====
   # These options help preserve more information without increasing image size:

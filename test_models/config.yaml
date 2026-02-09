@@ -1,5 +1,5 @@
 # Inference configuration
-# 
+#
 # IMPORTANT: For accurate metrics computation, organize input files as:
 #   input/benign/    - Files known to be benign
 #   input/malware/   - Files known to be malware
@@ -14,8 +14,8 @@ paths:
 inference:
   # Preprocessing target sizes (must match training config)
   resize_target_size: [64, 64]      # Target size for resize mode (width, height)
-  truncate_target_size: [256, 256]  # Target size for truncate mode (width, height)
-  
+  truncate_target_size: [64, 64]  # Target size for truncate mode (width, height)
+
   # Resize method options (should match training config for consistency)
   resize_interpolation: lanczos     # Interpolation: 'bilinear', 'bicubic', 'lanczos', 'area'
   resize_entropy_hybrid: false      # Enable hybrid entropy + uniform sampling
@@ -25,8 +25,20 @@ inference:
   truncate_entropy_stratify: true   # Enable multi-entropy sampling (top/mid/low bands)
   truncate_entropy_weighted: false  # Allocate pixels proportionally to entropy instead of hard selection
   truncate_use_frequency: false     # Augment entropy with byte-frequency dispersion
-  
+
   # Inference settings
   threshold: 0.5                    # Probability threshold for binary classification
   device: auto                      # auto | cpu | cuda
 
+visualization:
+  # Preprocessing mode for visualization UI
+  # Options:
+  #   resize   - use bytes_to_img_resize() logic
+  #   truncate - use bytes_to_img_truncate() logic
+  #   raw      - use uploaded PNG as-is
+  #   auto     - detect based on model input size
+  preprocess_mode: resize
+
+  # Parameter display mode
+  # Options: none | total | per_layer | running_total
+  show_params: per_layer

@@ -129,10 +129,10 @@ def parse_cli() -> TrainArgs:
     p = argparse.ArgumentParser(description="Train MalNet-FocusAug")
     p.add_argument("--data-csv", help="Override data CSV path (default: from config)")
     p.add_argument("--images-root", help="Override images root (default: from config)")
-    p.add_argument("--mode", choices=["resize", "truncate"], 
+    p.add_argument("--mode", choices=["resize", "truncate"],
                    help="Override training mode (default: from config.training.mode)")
     p.add_argument("--seed", type=int, help="Override seed (default: auto-increment or from config)")
-    p.add_argument("--resume", action="store_true", 
+    p.add_argument("--resume", action="store_true",
                    help="Resume training from checkpoint")
     a = p.parse_args()
 
@@ -147,7 +147,7 @@ def parse_cli() -> TrainArgs:
 
 def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
     cfg = _load_config_dict()
-    
+
     # Helper to parse target size from string or config
     def _parse_target_size(value, default: tuple[int, int]) -> tuple[int, int]:
         if value is None:
@@ -182,12 +182,12 @@ def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
     images_root = raw_cli.images_root if raw_cli.images_root else _get(cfg, "train_io.images_root", "dataset/output")
     runs_root = _get(cfg, "train_io.runs_root", "runs")
     export_root = _get(cfg, "training.export_root", "export_models")
-    
+
     # mode - read from config if not provided via CLI
     mode = raw_cli.mode if raw_cli.mode else _get(cfg, "training.mode", "resize")
     if mode not in ("resize", "truncate"):
         raise ValueError(f"Invalid mode '{mode}'. Must be 'resize' or 'truncate' (not 'both' - that's handled by main.py)")
-    
+
     # Parse target sizes from config (no CLI override - use config only)
     training_cfg = cfg.get("training", {})
     resize_size = _parse_target_size(training_cfg.get("resize_target_size"), (64, 64))
@@ -229,7 +229,7 @@ def apply_config_and_cli_defaults(args: TrainArgs, raw_cli) -> TrainArgs:
 
     # Seed handling - CLI override or auto-increment (handled elsewhere)
     seed = raw_cli.seed if raw_cli.seed is not None else _get(cfg, "training.seed", args.seed)
-    
+
     # Decode cache: read from config, with mode-specific defaults
     # Truncate mode benefits more from caching due to larger, expensive-to-decode PNGs
     decode_cache_mem_mb = _get(cfg, "training.decode_cache_mem_mb", None)
@@ -354,21 +354,21 @@ def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[T
         groups.setdefault(g, {"idxs": [], "label": 0})
         groups[g]["idxs"].append(i)
         groups[g]["label"] = max(groups[g]["label"], y)
-    
+
     # Separate positive and negative groups
     pos_groups = [(g, v) for g, v in groups.items() if v["label"] == 1]
     neg_groups = [(g, v) for g, v in groups.items() if v["label"] == 0]
     rng.shuffle(pos_groups)
     rng.shuffle(neg_groups)
-    
+
     # Calculate target sizes for each class to maintain balance
     N = len(rows)
     target_total = int(round(N * (holdout_pct / 100.0)))
-    
+
     # Count samples per class
     n_pos_total = sum(len(v["idxs"]) for _, v in pos_groups)
     n_neg_total = sum(len(v["idxs"]) for _, v in neg_groups)
-    
+
     # Allocate validation samples proportionally to class distribution
     if n_pos_total > 0 and n_neg_total > 0:
         pos_ratio = n_pos_total / N
@@ -386,10 +386,10 @@ def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[T
         # No samples (shouldn't happen)
         target_pos = 0
         target_neg = 0
-    
+
     # Select groups for validation set, maintaining class balance
     val_idxs = []
-    
+
     # Add positive groups
     pos_count = 0
     for g, v in pos_groups:
@@ -397,7 +397,7 @@ def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[T
             break
         val_idxs.extend(v["idxs"])
         pos_count += len(v["idxs"])
-    
+
     # Add negative groups
     neg_count = 0
     for g, v in neg_groups:
@@ -405,12 +405,12 @@ def build_holdout_split(rows: List[Dict], holdout_pct: int, seed: int) -> List[T
             break
         val_idxs.extend(v["idxs"])
         neg_count += len(v["idxs"])
-    
+
     val_idx = np.array(sorted(val_idxs), dtype=int)
     mask = np.ones(N, dtype=bool)
     mask[val_idx] = False
     train_idx = np.arange(N, dtype=int)[mask]
-    
+
     return [(train_idx, val_idx)]
 
 
@@ -463,11 +463,11 @@ class StratifiedRatioBatchSampler(BatchSampler):
 def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -> Dict[str, float]:
     y_true = labels.astype(int)
     y_score = scores.astype(float)
-    
+
     # Count positive and negative samples
     n_pos = int(y_true.sum())
     n_neg = int((1 - y_true).sum())
-    
+
     # Handle edge case: no positive samples
     if n_pos == 0:
         # Return NaN for metrics that require positive samples
@@ -483,7 +483,7 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -
             "support_pos": 0,
             "support_neg": n_neg,
         }
-    
+
     # Handle edge case: no negative samples
     if n_neg == 0:
         # Perfect classifier case
@@ -499,7 +499,7 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, fpr_budget: float) -
             "support_pos": n_pos,
             "support_neg": 0,
         }
-    
+
     # Normal case: compute metrics with warnings suppressed
     import warnings
     with warnings.catch_warnings():
@@ -560,24 +560,24 @@ def collate_variable_size(batch):
     """
     Custom collate function that handles variable-size images by padding to the maximum size.
     This is useful if images have different sizes (though preprocessing should produce fixed sizes).
-    
+
     Args:
         batch: List of (x, y, rel_path) tuples from dataset
-    
+
     Returns:
         (x_padded, y, rel_paths) where x_padded is batched and padded to max size
     """
     # Unpack batch
     images, labels, rel_paths = zip(*batch)
-    
+
     # Convert to tensors if needed
     images = [x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in images]
     labels = [y if isinstance(y, torch.Tensor) else torch.tensor(y, dtype=torch.long) for y in labels]
-    
+
     # Find max height and width
     max_h = max(img.shape[-2] for img in images)
     max_w = max(img.shape[-1] for img in images)
-    
+
     # Pad all images to max size (pad right and bottom with zeros)
     padded_images = []
     for img in images:
@@ -591,11 +591,11 @@ def collate_variable_size(batch):
         else:
             padded = img
         padded_images.append(padded)
-    
+
     # Stack into batch
     x_batch = torch.stack(padded_images, dim=0)  # (B, C, H, W)
     y_batch = torch.stack(labels, dim=0)  # (B,)
-    
+
     return x_batch, y_batch, list(rel_paths)
 
 # ---------- One epoch (robust batch unpack) ----------
@@ -707,12 +707,12 @@ def train_run(cfg: TrainArgs):
         decode_cache_mem_mb=cfg.decode_cache_mem_mb,
         target_size=tuple(expected_size),  # (width, height) - enables on-the-fly resizing
     )
-    
+
     if cfg.decode_cache_mem_mb > 0:
         print(f"[INFO] Tensor cache enabled: {cfg.decode_cache_mem_mb} MB (decoded PNGs cached in RAM)")
     else:
         print(f"[INFO] Tensor cache disabled (decode_cache_mem_mb=0)")
-    
+
     # Diagnostic: Check actual image dimensions vs expected
     if len(rows) > 0:
         from PIL import Image
@@ -730,43 +730,43 @@ def train_run(cfg: TrainArgs):
                     file_sizes.append(img_path.stat().st_size)
                 except Exception:
                     pass
-        
+
         if actual_sizes:
             # Get most common size
             from collections import Counter
             size_counts = Counter(actual_sizes)
             most_common_size = size_counts.most_common(1)[0][0]
             most_common_count = size_counts.most_common(1)[0][1]
-            
+
             print(f"[INFO] Actual PNG dimensions (sampled {len(actual_sizes)} files):")
             print(f"  Most common: {most_common_size[0]}x{most_common_size[1]} ({most_common_count}/{len(actual_sizes)} files)")
             print(f"  Expected from config: {expected_size[0]}x{expected_size[1]}")
-            
+
             if most_common_size != tuple(expected_size):
                 print(f"[WARN] Image dimensions don't match config!")
                 print(f"[WARN] PNGs on disk are {most_common_size[0]}x{most_common_size[1]}, but config expects {expected_size[0]}x{expected_size[1]}")
                 print(f"[WARN] Dataset will resize images on-the-fly to match config (this may slow down training)")
                 print(f"[WARN] To fix: re-run 'python main.py convert' with the new target_size to regenerate PNGs")
-            
+
             avg_file_size_kb = (sum(file_sizes) / len(file_sizes)) / 1024
             print(f"[INFO] Average PNG file size: {avg_file_size_kb:.1f} KB")
             if cfg.mode == "truncate" and avg_file_size_kb > 30:
                 print(f"[INFO] Truncate files are large ({avg_file_size_kb:.1f} KB avg) due to high-entropy content.")
                 print(f"[INFO] Consider: increasing decode_cache_mem_mb for faster repeated access, or using larger cache_max_bytes.")
-    
+
     # Create mapping from filtered row indices to dataset indices
     # The dataset loads ALL rows, but rows is filtered by mode
     # We need to map filtered_row_idx -> dataset_idx
     print(f"[INFO] Building index mapping: filtered rows ({len(rows)}) -> dataset items ({len(dataset)})")
     filtered_to_dataset_idx = []
     dataset_to_filtered_idx = {}  # Reverse mapping for validation
-    
+
     # Build mapping by matching rel_path and sha256
     for filtered_idx, row in enumerate(rows):
         row_rel = row["rel_path"]
         row_sha = row["sha256"]
         row_label = row["label"]
-        
+
         # Find matching item in dataset
         for dataset_idx, (item_rel, item_label, item_sha) in enumerate(dataset.items):
             if item_rel == row_rel and item_sha == row_sha and item_label == row_label:
@@ -779,13 +779,13 @@ def train_run(cfg: TrainArgs):
                 f"Filtered row {filtered_idx} (rel_path={row_rel}, sha256={row_sha}) "
                 f"not found in dataset. This indicates a mismatch between CSV filtering and dataset loading."
             )
-    
+
     if len(filtered_to_dataset_idx) != len(rows):
         raise ValueError(
             f"Index mapping incomplete: {len(filtered_to_dataset_idx)}/{len(rows)} rows mapped. "
             f"Dataset may be missing rows or have duplicates."
         )
-    
+
     print(f"[INFO] Index mapping complete: {len(filtered_to_dataset_idx)} rows mapped")
 
     device = torch.device("cuda" if (cfg.device == "cuda" or (cfg.device == "auto" and torch.cuda.is_available())) else "cpu")
@@ -814,11 +814,11 @@ def train_run(cfg: TrainArgs):
     for fi, (train_idx, val_idx) in enumerate(splits, start=1):
         print(f"\n=== Fold {fi}/{len(splits)} ===")
         print(f"[DEBUG] fold sizes -> train: {len(train_idx)} | val: {len(val_idx)}")
-        
+
         # Map filtered row indices to dataset indices
         train_dataset_idx = np.array([filtered_to_dataset_idx[i] for i in train_idx], dtype=int)
         val_dataset_idx = np.array([filtered_to_dataset_idx[i] for i in val_idx], dtype=int)
-        
+
         # Show class distribution in train/val splits (from filtered rows)
         train_labels_split = np.array([rows[i]['label'] for i in train_idx], dtype=int)
         val_labels_split = np.array([rows[i]['label'] for i in val_idx], dtype=int)
@@ -827,7 +827,7 @@ def train_run(cfg: TrainArgs):
         val_pos = int(val_labels_split.sum())
         val_neg = len(val_labels_split) - val_pos
         print(f"[DEBUG] class distribution -> train: pos={train_pos} neg={train_neg} | val: pos={val_pos} neg={val_neg}")
-        
+
         if val_pos == 0:
             print(f"[WARN] Validation set has no positive samples! This will cause metric computation issues.")
             print(f"[WARN] Consider using kfold > 1 for stratified cross-validation, or check your dataset balance.")
@@ -843,7 +843,7 @@ def train_run(cfg: TrainArgs):
 
         # Verify labels match between filtered rows and dataset
         # Sample a few indices to verify
-        sample_indices = np.concatenate([train_dataset_idx[:min(5, len(train_dataset_idx))], 
+        sample_indices = np.concatenate([train_dataset_idx[:min(5, len(train_dataset_idx))],
                                         val_dataset_idx[:min(5, len(val_dataset_idx))]])
         for dataset_idx in sample_indices:
             filtered_idx = dataset_to_filtered_idx.get(dataset_idx)
@@ -940,7 +940,7 @@ def train_run(cfg: TrainArgs):
                 val_loss, val_logits, val_labels = one_epoch(model, val_loader, device,optimizer=None, desc=f"val   f{fi} e{epoch}")
 
                 val_scores = sigmoid_np(val_logits)
-                
+
                 # Debug: Check actual labels from dataset on first epoch
                 if epoch == 1:
                     actual_pos = int(val_labels.sum())
@@ -953,7 +953,7 @@ def train_run(cfg: TrainArgs):
                         print(f"[ERROR] Actual from dataset: pos={actual_pos}, neg={actual_neg}")
                         print(f"[ERROR] This indicates the dataset indices don't match the filtered row indices.")
                         print(f"[ERROR] Check the index mapping logic.")
-                
+
                 metrics = compute_metrics(val_scores, val_labels, cfg.fpr_budget)
                 acc05 = float(((val_scores >= 0.5).astype(int) == val_labels).mean()) if len(val_labels) > 0 else float("nan")
 
@@ -962,7 +962,7 @@ def train_run(cfg: TrainArgs):
                     if np.isnan(v):
                         return "nan"
                     return f"{v:.3f}"
-                
+
                 # Warn if no positive samples in validation
                 if metrics["support_pos"] == 0:
                     print(f"[WARN] Validation set has no positive samples (pos={metrics['support_pos']}, neg={metrics['support_neg']})")
@@ -1048,6 +1048,12 @@ def train_run(cfg: TrainArgs):
             iter_id = max(int(p.stem.split("_")[-1]) for p in existing) + 1
         except Exception:
             iter_id = len(existing) + 1
+
+    # Save eager-mode weights for visualization
+    eager_out = export_dir / f"cnn_{cfg.mode}_{cfg.seed}_{iter_id}.pt"
+    torch.save(model.state_dict(), eager_out)
+    print(f"[EXPORT] Saved eager model weights: {eager_out.as_posix()}")
+
     out_path = export_dir / f"cnn_{cfg.mode}_{cfg.seed}_{iter_id}.ts.pt"
 
     example = torch.randn(1, 1, 256, 256)
