@@ -1,6 +1,9 @@
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
+
 import numpy as np
 import streamlit as st
 import torch
@@ -248,13 +251,7 @@ def precompute_2d_images(activations, view_order, conv_weights):
 # 3D helpers
 # ------------------------------------------------------------
 def downsample_2d(arr: np.ndarray, max_size: int = 16) -> np.ndarray:
-    """Aggressive downsampling for efficiency."""
-    h, w = arr.shape
-    if h <= max_size and w <= max_size:
-        return arr
-    sh = max(1, h // max_size)
-    sw = max(1, w // max_size)
-    return arr[::sh, ::sw]
+    return arr
 
 
 def precompute_architecture_3d(activations, view_order):
@@ -364,7 +361,10 @@ def render_2d_view():
                         break
                     act_img, _ = layer_data[idx_map]
                     with cols[i]:
-                        st.image(act_img, caption=f"Feature map {idx_map}", width="stretch")
+                        import io
+                        buf = io.BytesIO()
+                        act_img.save(buf, format="PNG")
+                        st.image(buf.getvalue(), caption=f"Feature map {idx_map}", use_column_width=True)
                     idx_map += 1
 
     else:
@@ -393,17 +393,21 @@ def render_2d_view():
 
 
 # ------------------------------------------------------------
-# 3D view (static image, dense Z, progressive build)
+# 3D view (static, dense Z, progressive, dynamic camera, highlight)
 # ------------------------------------------------------------
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa
+import numpy as np
+import streamlit as st
+
+
 def render_3d_architecture():
     arch_data = st.session_state.precomputed_arch_3d
     view_order = st.session_state.view_order
     if arch_data is None or not view_order:
         return
 
-    idx = get_layer_index()
-
-    # All layers up to current
+    idx = st.session_state.layer_idx
     visible_names = set(view_order[: idx + 1])
     visible_layers = [d for d in arch_data if d["layer_name"] in visible_names]
 
@@ -411,76 +415,202 @@ def render_3d_architecture():
         st.info("No 3D representation for these layers.")
         return
 
-    fig = go.Figure()
+    # --- baseline footprint from FIRST layer's first surface (downsampled size) ---
+    first_layer_entry = arch_data[0]
+    first_surface = first_layer_entry["surfaces"][0]
+    base_H, base_W = first_surface["values"].shape
+
+    fig = plt.figure(figsize=(4, 4), dpi=80)
+    ax = fig.add_subplot(111, projection="3d")
 
     z_cursor = 0
+    layer_first_z = {}
 
-    for layer_i, layer_entry in enumerate(visible_layers):
-        # More aggressive downsampling for earlier layers
-        if layer_i < len(visible_layers) - 3:
-            local_downsample = 8
-        else:
-            local_downsample = 16
+    def rwb_rgba(values, alpha=0.75):
+        mask = np.isnan(values)
+
+        v = np.clip(values.astype(np.float32), -1.0, 1.0)
+        h, w = v.shape
+        rgba = np.zeros((h, w, 4), dtype=np.float32)
+
+        pos = v > 0
+        neg = v < 0
+        zero = v == 0
+
+        rgba[pos] = np.stack([
+            (1 - v[pos]),
+            (1 - v[pos]),
+            np.ones_like(v[pos]),
+            np.full_like(v[pos], alpha)
+        ], axis=-1)
+
+        rgba[neg] = np.stack([
+            np.ones_like(v[neg]),
+            np.abs(v[neg]),
+            np.abs(v[neg]),
+            np.full_like(v[neg], alpha)
+        ], axis=-1)
+
+        rgba[zero] = np.array([1, 1, 1, alpha], dtype=np.float32)
+
+        # padded regions fully transparent
+        rgba[mask] = np.array([0, 0, 0, 0], dtype=np.float32)
+
+        return rgba
+
+    # global X/Y grid based on baseline footprint
+    x_base = np.linspace(0, base_W - 1, base_W)
+    y_base = np.linspace(0, base_H - 1, base_H)
+    X_base, Y_base = np.meshgrid(x_base, y_base)
+
+    surfaces = []
+
+    for layer_entry in visible_layers:
+        lname = layer_entry["layer_name"]
+        first_z = z_cursor
 
         for surf in layer_entry["surfaces"]:
-            X = surf["x"]
-            Y = surf["y"]
-            V = surf["values"]
+            fmap = surf["values"]
+            Hds, Wds = fmap.shape
 
-            # Downsample again if needed
-            if local_downsample != 16:
-                H, W = V.shape
-                sh = max(1, H // local_downsample)
-                sw = max(1, W // local_downsample)
-                V = V[::sh, ::sw]
-                x = np.linspace(0, X.max(), V.shape[1])
-                y = np.linspace(0, Y.max(), V.shape[0])
-                X, Y = np.meshgrid(x, y)
+            if lname == view_order[0]:
+                # first layer: unaltered, already base size by definition
+                fmap_pad = fmap
+            else:
+                # later layers: pad up to baseline size, extra pixels transparent
+                pad_h = base_H - Hds
+                pad_w = base_W - Wds
+                fmap_pad = np.pad(
+                    fmap,
+                    ((0, pad_h), (0, pad_w)),
+                    mode="constant",
+                    constant_values=np.nan
+                )
 
-            Z = np.full_like(X, z_cursor, dtype=float)
+            X = X_base
+            Y = Y_base
 
-            fig.add_surface(
-                x=X,
-                y=Y,
-                z=Z,
-                surfacecolor=V,
-                colorscale=[
-                    [0.0, "rgb(255,0,0)"],
-                    [0.5, "rgb(255,255,255)"],
-                    [1.0, "rgb(0,0,255)"],
-                ],
-                cmin=-1.0,
-                cmax=1.0,
-                showscale=False,
-                hoverinfo="name",
-                opacity=0.75,
-            )
+            Z = np.full_like(X, float(z_cursor) + 1e-3 * z_cursor)
+            fc = rwb_rgba(fmap_pad)
 
+            surfaces.append((z_cursor, X, Y, Z, fc))
             z_cursor += 1
 
-    fig.update_layout(
-        scene=dict(
-            xaxis_title="Width",
-            yaxis_title="Height",
-            zaxis_title="Channel index (dense stack)",
-            xaxis=dict(backgroundcolor="#1a1a1a", gridcolor="#444444", zerolinecolor="#666666", color="white"),
-            yaxis=dict(backgroundcolor="#1a1a1a", gridcolor="#444444", zerolinecolor="#666666", color="white"),
-            zaxis=dict(backgroundcolor="#1a1a1a", gridcolor="#444444", zerolinecolor="#666666", color="white"),
-        ),
-        paper_bgcolor="#1a1a1a",
-        plot_bgcolor="#1a1a1a",
-        margin=dict(l=0, r=0, t=0, b=0),
-        font=dict(color="white"),
-        uirevision="constant",
-    )
+        layer_first_z[lname] = first_z
 
-    # Static image with fallback
-    try:
-        img_bytes = pio.to_image(fig, format="png")
-        st.image(img_bytes, caption="3D Architecture (static)")
-    except Exception:
-        st.plotly_chart(fig, use_container_width=True)
+    # strict bottom→top ordering
+    surfaces.sort(key=lambda t: t[0])
 
+    all_x = np.concatenate([s[1].ravel() for s in surfaces])
+    all_y = np.concatenate([s[2].ravel() for s in surfaces])
+    cx = all_x.mean()
+    cy = all_y.mean()
+
+    shrink = 1.4
+
+    for _, X, Y, Z, fc in surfaces:
+        Xs = (X - cx) * shrink + cx
+        Ys = (Y - cy) * shrink + cy
+
+        ax.plot_surface(
+            Xs, Ys, Z,
+            facecolors=fc,
+            rstride=1,
+            cstride=1,
+            linewidth=0,
+            antialiased=False,
+            shade=False,
+        )
+
+    # --- highlight current layer slice ---
+    current_layer_name = view_order[idx]
+    if current_layer_name in layer_first_z:
+        first_z = layer_first_z[current_layer_name]
+        current_layer_entry = next(
+            (d for d in arch_data if d["layer_name"] == current_layer_name), None
+        )
+
+        if current_layer_entry and current_layer_entry["surfaces"]:
+            base = current_layer_entry["surfaces"][0]
+            fmap = base["values"]
+            Hds, Wds = fmap.shape
+
+            # pad fmap to baseline for masking (transparent outside real slice)
+            pad_h = base_H - Hds
+            pad_w = base_W - Wds
+            fmap_pad = np.pad(
+                fmap,
+                ((0, pad_h), (0, pad_w)),
+                mode="constant",
+                constant_values=np.nan
+            )
+
+            # base grid for this layer
+            Xb = X_base.copy()
+            Yb = Y_base.copy()
+
+            # compute center of the REAL slice region (0:Hds, 0:Wds)
+            X_slice = Xb[:Hds, :Wds]
+            Y_slice = Yb[:Hds, :Wds]
+            cx_slice = X_slice.mean()
+            cy_slice = Y_slice.mean()
+
+            # build highlight grid: 15% larger than current slice size
+            Xh = Xb.copy()
+            Yh = Yb.copy()
+
+            # scale only the region corresponding to the real slice
+            Xh[:Hds, :Wds] = (X_slice - cx_slice) * 1.15 + cx_slice
+            Yh[:Hds, :Wds] = (Y_slice - cy_slice) * 1.15 + cy_slice
+
+            # shrink to match model scale
+            Xh = (Xh - cx) * shrink + cx
+            Yh = (Yh - cy) * shrink + cy
+
+            Zp = np.full_like(Xh, float(first_z) + 1e-3 * first_z)
+
+            highlight_rgba = np.zeros((base_H, base_W, 4), dtype=np.float32)
+            highlight_rgba[..., 0] = 1.0
+            highlight_rgba[..., 1] = 1.0
+            highlight_rgba[..., 2] = 0.0
+            highlight_rgba[..., 3] = 0.3  # 30% opaque
+
+            # fully transparent outside the real slice region
+            mask_pad = np.isnan(fmap_pad)
+            highlight_rgba[mask_pad] = np.array([0, 0, 0, 0], dtype=np.float32)
+
+            ax.plot_surface(
+                Xh, Yh, Zp,
+                facecolors=highlight_rgba,
+                rstride=1,
+                cstride=1,
+                linewidth=0,
+                antialiased=False,
+                shade=False,
+            )
+
+    max_z = max(1, z_cursor)
+    base_elev = 40.0
+    min_elev = 8.0
+    elev = max(min_elev, base_elev - 0.14 * max_z)
+
+    ax.view_init(elev=elev, azim=45)
+    ax.set_box_aspect((1, 1, .6))
+
+    ax.set_xlabel("Width", color="white")
+    ax.set_ylabel("Height", color="white")
+    ax.set_zlabel("Channel index", color="white")
+
+    ax.tick_params(colors="white")
+    ax.set_facecolor("#1a1a1a")
+    fig.patch.set_facecolor("#1a1a1a")
+
+    plt.tight_layout()
+
+    # center the plot on the page
+    center = st.columns([1, 2, 1])[1]
+    with center:
+        st.pyplot(fig, use_container_width=False)
 
 # ------------------------------------------------------------
 # Main UI
@@ -628,14 +758,15 @@ def main():
     st.subheader(render_current_layer_info())
 
     col_prev, col_next, col_view = st.columns([1, 1, 2])
+
     with col_prev:
         if st.button("⬅️ Previous layer"):
             step_layer(-1)
-            st.rerun()
+
     with col_next:
         if st.button("Next layer ➡️"):
             step_layer(+1)
-            st.rerun()
+
     with col_view:
         st.session_state.view_mode = st.radio(
             "View",
@@ -644,6 +775,7 @@ def main():
             horizontal=True,
         )
 
+    # Always regenerate after button press
     if st.session_state.view_mode == "2D View":
         render_2d_view()
     else:
