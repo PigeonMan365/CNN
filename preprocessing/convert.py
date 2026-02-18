@@ -877,6 +877,41 @@ def convert_file(input_path: Path, mode: str, images_root: Path, label: str,
     img.save(out_png, format="PNG", optimize=True, compress_level=6)
     return out_png
 
+def load_done_sha256_from_log(csv_path: Path) -> set[str]:
+    """
+    Read conversion_log.csv and return the set of input file SHA256 hashes
+    that are already recorded (i.e. already converted). Used to resume conversion.
+    """
+    out: set[str] = set()
+    if not csv_path.exists():
+        return out
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                sha = (row.get("sha256") or "").strip()
+                if sha:
+                    out.add(sha.lower())
+    except Exception:
+        pass
+    return out
+
+
+def append_rows_to_conversion_log(csv_path: Path, rows: list[Tuple[str, int, str, str]]) -> None:
+    """
+    Append rows to conversion_log.csv. If the file does not exist, write the header first.
+    Each row is (rel_path, label, mode, sha256) with label 0=benign, 1=malware.
+    """
+    ensure_dir(csv_path.parent)
+    exists = csv_path.exists()
+    with csv_path.open("a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(["rel_path", "label", "mode", "sha256"])
+        for rel_path, label, mode, sha in rows:
+            w.writerow([rel_path, label, mode, sha])
+
+
 def rebuild_conversion_log(images_root: Path, csv_path: Path) -> int:
     """
     Rebuild logs/conversion_log.csv by scanning images_root.
@@ -1008,27 +1043,53 @@ def run_all(config_path: str = "config.yaml",
         items = _collect_inputs(input_roots)
         if not items:
             print("[convert] No input files found under the configured input_roots.", file=sys.stderr)
-        # Convert every file into BOTH modes; idempotent if already exists
-        total_written = 0
-        for (src, label) in tqdm(items, desc="converting", unit="file"):
-            for mode in MODES:
-                out = convert_file(src, mode, images_root, label,
-                                 resize_target_size=resize_size,
-                                 truncate_target_size=truncate_size,
-                                 resize_resample=resize_interpolation,
-                                 resize_entropy_hybrid=resize_entropy_hybrid,
-                                 resize_entropy_ratio=resize_entropy_ratio,
-                                 truncate_chunk_size=truncate_chunk_size,
-                                 truncate_entropy_stratify=truncate_entropy_stratify,
-                                 truncate_entropy_weighted=truncate_entropy_weighted,
-                                 truncate_use_frequency=truncate_use_frequency)
-                if out is not None:
-                    total_written += 1
-        print(f"[convert] Wrote {total_written} PNG(s) under {images_root}")
-        print(f"[convert] Using target sizes: resize={resize_size}, truncate={truncate_size}")
+        else:
+            # Resume: skip inputs already present in conversion log
+            done_sha = load_done_sha256_from_log(conv_csv)
+            remaining: list[tuple[Path, str, str]] = []  # (path, label, sha)
+            for (src, label) in tqdm(items, desc="scanning inputs", unit="file", leave=False):
+                sha = sha256_file(src)
+                if sha not in done_sha:
+                    remaining.append((src, label, sha))
+            if done_sha:
+                print(f"[convert] Resuming: {len(done_sha)} already in log, {len(remaining)} left to convert")
+            n_total = len(remaining)
+            if n_total == 0:
+                print("[convert] All inputs already converted; nothing to do.")
+            else:
+                # Process in 1% chunks; update conversion log after each chunk
+                chunk_size = max(1, n_total // 100)
+                total_written = 0
+                for start in range(0, n_total, chunk_size):
+                    batch = remaining[start : start + chunk_size]
+                    new_rows: list[Tuple[str, int, str, str]] = []
+                    for (src, label, sha) in batch:
+                        label_int = 0 if label == "benign" else 1
+                        for mode in MODES:
+                            out = convert_file(src, mode, images_root, label,
+                                             resize_target_size=resize_size,
+                                             truncate_target_size=truncate_size,
+                                             resize_resample=resize_interpolation,
+                                             resize_entropy_hybrid=resize_entropy_hybrid,
+                                             resize_entropy_ratio=resize_entropy_ratio,
+                                             truncate_chunk_size=truncate_chunk_size,
+                                             truncate_entropy_stratify=truncate_entropy_stratify,
+                                             truncate_entropy_weighted=truncate_entropy_weighted,
+                                             truncate_use_frequency=truncate_use_frequency)
+                            if out is not None:
+                                total_written += 1
+                                rel = out.relative_to(images_root).as_posix()
+                                new_rows.append((rel, label_int, mode, sha))
+                    if new_rows:
+                        append_rows_to_conversion_log(conv_csv, new_rows)
+                    pct = min(100, (start + len(batch)) * 100 // n_total)
+                    print(f"[convert] Progress: {pct}% ({start + len(batch)}/{n_total} files) — log updated.")
+                print(f"[convert] Wrote {total_written} PNG(s) under {images_root}")
+                print(f"[convert] Using target sizes: resize={resize_size}, truncate={truncate_size}")
 
-    # Always rebuild CSV from disk to avoid duplicates/stale rows
-    rebuild_conversion_log(images_root, conv_csv)
+    # Rebuild CSV only when not converting (rebuild_only/skip_convert), so incremental updates are preserved
+    if rebuild_only or skip_convert:
+        rebuild_conversion_log(images_root, conv_csv)
 
 # ---------------- CLI ----------------
 
