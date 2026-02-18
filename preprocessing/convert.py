@@ -974,6 +974,27 @@ def _collect_inputs(input_roots: Iterable[Path]) -> list[tuple[Path, str]]:
                     out.append((p, label))
     return out
 
+
+def _iter_inputs(input_roots: Iterable[Path]) -> Iterable[tuple[Path, str]]:
+    """
+    Yield (file_path, label) pairs under each input_root/{benign,malware}/ without building a full list.
+    """
+    for in_root in input_roots:
+        base = Path(in_root).resolve()
+        for label in LABELS:
+            src_dir = base / label
+            if not src_dir.exists():
+                continue
+            for p in src_dir.iterdir():
+                if p.is_file():
+                    yield (p, label)
+
+
+def _already_converted(sha: str, label: str, images_root: Path) -> bool:
+    """Return True if both resize and truncate PNGs exist for this input (no log read)."""
+    base = images_root / label
+    return (base / "resize" / f"{sha}.png").exists() and (base / "truncate" / f"{sha}.png").exists()
+
 def _print_input_summary(input_roots: Iterable[Path]) -> None:
     print("[convert] input file counts:")
     for in_root in input_roots:
@@ -1040,52 +1061,75 @@ def run_all(config_path: str = "config.yaml",
 
     if not rebuild_only and not skip_convert:
         _print_input_summary(input_roots)
-        items = _collect_inputs(input_roots)
-        if not items:
+        # Progressive: count total first (lightweight pass, no hashing), then scan 1% → process → log, repeat
+        total_inputs = sum(1 for _ in _iter_inputs(input_roots))
+        if total_inputs == 0:
             print("[convert] No input files found under the configured input_roots.", file=sys.stderr)
         else:
-            # Resume: skip inputs already present in conversion log
-            done_sha = load_done_sha256_from_log(conv_csv)
-            remaining: list[tuple[Path, str, str]] = []  # (path, label, sha)
-            for (src, label) in tqdm(items, desc="scanning inputs", unit="file", leave=False):
-                sha = sha256_file(src)
-                if sha not in done_sha:
-                    remaining.append((src, label, sha))
-            if done_sha:
-                print(f"[convert] Resuming: {len(done_sha)} already in log, {len(remaining)} left to convert")
-            n_total = len(remaining)
-            if n_total == 0:
-                print("[convert] All inputs already converted; nothing to do.")
-            else:
-                # Process in 1% chunks; update conversion log after each chunk
-                chunk_size = max(1, n_total // 100)
-                total_written = 0
-                for start in range(0, n_total, chunk_size):
-                    batch = remaining[start : start + chunk_size]
-                    new_rows: list[Tuple[str, int, str, str]] = []
-                    for (src, label, sha) in batch:
-                        label_int = 0 if label == "benign" else 1
-                        for mode in MODES:
-                            out = convert_file(src, mode, images_root, label,
-                                             resize_target_size=resize_size,
-                                             truncate_target_size=truncate_size,
-                                             resize_resample=resize_interpolation,
-                                             resize_entropy_hybrid=resize_entropy_hybrid,
-                                             resize_entropy_ratio=resize_entropy_ratio,
-                                             truncate_chunk_size=truncate_chunk_size,
-                                             truncate_entropy_stratify=truncate_entropy_stratify,
-                                             truncate_entropy_weighted=truncate_entropy_weighted,
-                                             truncate_use_frequency=truncate_use_frequency)
-                            if out is not None:
-                                total_written += 1
-                                rel = out.relative_to(images_root).as_posix()
-                                new_rows.append((rel, label_int, mode, sha))
-                    if new_rows:
-                        append_rows_to_conversion_log(conv_csv, new_rows)
-                    pct = min(100, (start + len(batch)) * 100 // n_total)
-                    print(f"[convert] Progress: {pct}% ({start + len(batch)}/{n_total} files) — log updated.")
-                print(f"[convert] Wrote {total_written} PNG(s) under {images_root}")
-                print(f"[convert] Using target sizes: resize={resize_size}, truncate={truncate_size}")
+            chunk_size = max(1, total_inputs // 100)
+            total_written = 0
+            total_skipped = 0
+            processed = 0
+            batch: list[tuple[Path, str]] = []  # (path, label) for this 1% slice only
+
+            def process_batch(
+                batch_paths: list[tuple[Path, str]],
+            ) -> tuple[list[Tuple[str, int, str, str]], int, int]:
+                """Process one batch: hash, skip if done, convert. Returns (new_rows, written, skipped)."""
+                new_rows: list[Tuple[str, int, str, str]] = []
+                written = 0
+                skipped = 0
+                for (path, label) in batch_paths:
+                    sha = sha256_file(path)
+                    if _already_converted(sha, label, images_root):
+                        skipped += 1
+                        continue
+                    label_int = 0 if label == "benign" else 1
+                    for mode in MODES:
+                        out = convert_file(path, mode, images_root, label,
+                                         resize_target_size=resize_size,
+                                         truncate_target_size=truncate_size,
+                                         resize_resample=resize_interpolation,
+                                         resize_entropy_hybrid=resize_entropy_hybrid,
+                                         resize_entropy_ratio=resize_entropy_ratio,
+                                         truncate_chunk_size=truncate_chunk_size,
+                                         truncate_entropy_stratify=truncate_entropy_stratify,
+                                         truncate_entropy_weighted=truncate_entropy_weighted,
+                                         truncate_use_frequency=truncate_use_frequency)
+                        if out is not None:
+                            written += 1
+                            rel = out.relative_to(images_root).as_posix()
+                            new_rows.append((rel, label_int, mode, sha))
+                return new_rows, written, skipped
+
+            for (path, label) in _iter_inputs(input_roots):
+                batch.append((path, label))
+                if len(batch) < chunk_size:
+                    continue
+                # This 1% is scanned; now process it and update log
+                new_rows, written, skipped = process_batch(batch)
+                if new_rows:
+                    append_rows_to_conversion_log(conv_csv, new_rows)
+                total_written += written
+                total_skipped += skipped
+                processed += len(batch)
+                pct = min(100, processed * 100 // total_inputs)
+                print(f"[convert] Progress: {pct}% ({processed}/{total_inputs} inputs) — {total_written} PNGs written, log updated.")
+                batch.clear()
+
+            if batch:
+                new_rows, written, skipped = process_batch(batch)
+                if new_rows:
+                    append_rows_to_conversion_log(conv_csv, new_rows)
+                total_written += written
+                total_skipped += skipped
+                processed += len(batch)
+                print(f"[convert] Progress: 100% ({processed}/{total_inputs} inputs) — {total_written} PNGs written, log updated.")
+
+            if total_skipped:
+                print(f"[convert] Skipped {total_skipped} already-converted input(s).")
+            print(f"[convert] Wrote {total_written} PNG(s) under {images_root}")
+            print(f"[convert] Using target sizes: resize={resize_size}, truncate={truncate_size}")
 
     # Rebuild CSV only when not converting (rebuild_only/skip_convert), so incremental updates are preserved
     if rebuild_only or skip_convert:
