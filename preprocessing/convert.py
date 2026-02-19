@@ -51,7 +51,7 @@ import csv
 import hashlib
 import sys
 from pathlib import Path
-from typing import Iterable, Tuple, Optional
+from typing import Iterable, Tuple, Optional, List
 
 # --- Optional nice progress ---
 try:
@@ -310,6 +310,18 @@ def sha256_file(p: Path, chunk_size: int = 1 << 20) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_file_safe(p: Path, chunk_size: int = 1 << 20) -> Optional[str]:
+    """Return SHA256 hex digest of file, or None if the file cannot be read (logs to stderr)."""
+    try:
+        return sha256_file(p, chunk_size=chunk_size)
+    except OSError as e:
+        print(f"[convert] SKIP (read error): {p} — {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[convert] SKIP (unexpected): {p} — {e}", file=sys.stderr)
+        return None
 
 def load_yaml(path: str = "config.yaml") -> dict:
     try:
@@ -1069,65 +1081,98 @@ def run_all(config_path: str = "config.yaml",
             chunk_size = max(1, total_inputs // 100)
             total_written = 0
             total_skipped = 0
+            total_failed: List[Tuple[Path, str, str]] = []  # (path, label, error)
             processed = 0
             batch: list[tuple[Path, str]] = []  # (path, label) for this 1% slice only
 
             def process_batch(
                 batch_paths: list[tuple[Path, str]],
-            ) -> tuple[list[Tuple[str, int, str, str]], int, int]:
-                """Process one batch: hash, skip if done, convert. Returns (new_rows, written, skipped)."""
+            ) -> tuple[list[Tuple[str, int, str, str]], int, int, List[Tuple[Path, str, str]]]:
+                """Process one batch: hash, skip if done, convert. Returns (new_rows, written, skipped, failed)."""
                 new_rows: list[Tuple[str, int, str, str]] = []
                 written = 0
                 skipped = 0
+                failed: List[Tuple[Path, str, str]] = []  # (path, label, error_message)
                 for (path, label) in batch_paths:
-                    sha = sha256_file(path)
+                    try:
+                        sha = sha256_file(path)
+                    except OSError as e:
+                        failed.append((path, label, str(e)))
+                        print(f"[convert] SKIP (read): {path} — {e}", file=sys.stderr)
+                        continue
+                    except Exception as e:
+                        failed.append((path, label, str(e)))
+                        print(f"[convert] SKIP (hash): {path} — {e}", file=sys.stderr)
+                        continue
                     if _already_converted(sha, label, images_root):
                         skipped += 1
                         continue
                     label_int = 0 if label == "benign" else 1
-                    for mode in MODES:
-                        out = convert_file(path, mode, images_root, label,
-                                         resize_target_size=resize_size,
-                                         truncate_target_size=truncate_size,
-                                         resize_resample=resize_interpolation,
-                                         resize_entropy_hybrid=resize_entropy_hybrid,
-                                         resize_entropy_ratio=resize_entropy_ratio,
-                                         truncate_chunk_size=truncate_chunk_size,
-                                         truncate_entropy_stratify=truncate_entropy_stratify,
-                                         truncate_entropy_weighted=truncate_entropy_weighted,
-                                         truncate_use_frequency=truncate_use_frequency)
-                        if out is not None:
-                            written += 1
-                            rel = out.relative_to(images_root).as_posix()
-                            new_rows.append((rel, label_int, mode, sha))
-                return new_rows, written, skipped
+                    try:
+                        for mode in MODES:
+                            out = convert_file(path, mode, images_root, label,
+                                             resize_target_size=resize_size,
+                                             truncate_target_size=truncate_size,
+                                             resize_resample=resize_interpolation,
+                                             resize_entropy_hybrid=resize_entropy_hybrid,
+                                             resize_entropy_ratio=resize_entropy_ratio,
+                                             truncate_chunk_size=truncate_chunk_size,
+                                             truncate_entropy_stratify=truncate_entropy_stratify,
+                                             truncate_entropy_weighted=truncate_entropy_weighted,
+                                             truncate_use_frequency=truncate_use_frequency)
+                            if out is not None:
+                                written += 1
+                                rel = out.relative_to(images_root).as_posix()
+                                new_rows.append((rel, label_int, mode, sha))
+                    except OSError as e:
+                        failed.append((path, label, str(e)))
+                        print(f"[convert] SKIP (convert): {path} — {e}", file=sys.stderr)
+                    except Exception as e:
+                        failed.append((path, label, str(e)))
+                        print(f"[convert] SKIP (convert): {path} — {e}", file=sys.stderr)
+                return new_rows, written, skipped, failed
 
             for (path, label) in _iter_inputs(input_roots):
                 batch.append((path, label))
                 if len(batch) < chunk_size:
                     continue
                 # This 1% is scanned; now process it and update log
-                new_rows, written, skipped = process_batch(batch)
+                new_rows, written, skipped, failed = process_batch(batch)
                 if new_rows:
                     append_rows_to_conversion_log(conv_csv, new_rows)
                 total_written += written
                 total_skipped += skipped
+                total_failed.extend(failed)
                 processed += len(batch)
                 pct = min(100, processed * 100 // total_inputs)
                 print(f"[convert] Progress: {pct}% ({processed}/{total_inputs} inputs) — {total_written} PNGs written, log updated.")
                 batch.clear()
 
             if batch:
-                new_rows, written, skipped = process_batch(batch)
+                new_rows, written, skipped, failed = process_batch(batch)
                 if new_rows:
                     append_rows_to_conversion_log(conv_csv, new_rows)
                 total_written += written
                 total_skipped += skipped
+                total_failed.extend(failed)
                 processed += len(batch)
                 print(f"[convert] Progress: 100% ({processed}/{total_inputs} inputs) — {total_written} PNGs written, log updated.")
 
             if total_skipped:
                 print(f"[convert] Skipped {total_skipped} already-converted input(s).")
+            if total_failed:
+                failed_log = conv_csv.parent / "conversion_failed.csv"
+                try:
+                    write_header = not failed_log.exists() or failed_log.stat().st_size == 0
+                    with failed_log.open("a", encoding="utf-8", newline="") as f:
+                        w = csv.writer(f)
+                        if write_header:
+                            w.writerow(["path", "label", "error"])
+                        for (p, lbl, err) in total_failed:
+                            w.writerow([str(p), lbl, err])
+                    print(f"[convert] {len(total_failed)} file(s) skipped due to errors; see {failed_log}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[convert] {len(total_failed)} file(s) skipped due to errors (could not write {failed_log}: {e})", file=sys.stderr)
             print(f"[convert] Wrote {total_written} PNG(s) under {images_root}")
             print(f"[convert] Using target sizes: resize={resize_size}, truncate={truncate_size}")
 
